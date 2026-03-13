@@ -95,9 +95,22 @@ The arguments are as follows:
 
 (iii) single_file_index: use 1 if the index was built with the single-file format (see `single_file_index` flag in `build_disk_index`), 0 otherwise.
 
-(iv) tags: use 1 to enable tag-based recall measurement (requires the index to have been built with tags), 0 to disable.
+(iv) tags: controls whether the index translates physical (internal) node IDs to logical (external) IDs using a pre-built tag mapping.
 
-(v) num_nodes_to_cache: our program stores the entire graph on disk. For faster search performance, we provide the support to cache a few nodes (which are closest to the starting point) in memory. Typical values range from 0 (no cache) to 500000 depending on available RAM. For 100M-scale datasets, values of 100000-500000 are recommended.
+  - tags=0 (disabled): search results are returned as **physical node IDs** — the 0-based row index of each point in the original data file. Use this when your dataset IDs are simply 0..N-1 or when no logical ID remapping is needed. This is the typical default.
+  - tags=1 (enabled): each physical node ID is looked up in the `{index_prefix}_disk.index.tags` file, which stores a user-defined logical (external) ID for each point. Results are returned as those logical IDs. This requires the index to have been built with tag support.
+
+  Note: `tags` does *not* refer to a slot/physical ID indicator. Rather it is a per-point user-defined ID that lives alongside the graph. Setting tags=0 means "use the natural physical row index as the ID".
+
+(v) num_nodes_to_cache: the number of graph nodes to pre-load into RAM before any query is processed (offline / pre-query cache). These nodes are selected by breadth-first search (BFS) from the medoid, so the most-visited starting nodes are cached. **Unit: number of graph nodes** (not bytes or sectors).
+
+  - A **cached** node's neighbor list and full coordinates are served entirely from RAM — zero disk I/O.
+  - A **non-cached** node requires a physical disk read (each such read is counted as one entry in `n_ios` / "Mean IOs" in the output table).
+  - Increasing `num_nodes_to_cache` reduces disk I/O and query latency at the cost of higher RAM usage.
+  - To observe the effect on I/O, run the same query set with values such as 0, 10000, 50000, 100000, 500000 and compare the "Mean IOs" and "Mean Latency" columns.
+  - Approximate RAM cost per cached node: `(max_degree + 1) × 4` bytes (neighbor list) + `aligned_dim × sizeof(T)` bytes (coordinates).
+  - Value 0 disables the cache entirely; all node lookups go to disk.
+  - For 100M-scale datasets, 100000–500000 is a good starting range depending on available RAM.
 
 (vi) num_threads: search using specified number of threads in parallel, one thread per query. Use 1 for single-threaded (streaming/sequential) search. More threads will result in higher throughput but also more concurrent IOs; find the balance depending on the SSD bandwidth. For latency-sensitive single-query workloads, use 1.
 
@@ -278,9 +291,22 @@ The arguments are as follows:
 
 (iii) single_file_index: use 1 if the index was built with the single-file format (see `single_file_index` flag in `build_disk_index`), 0 otherwise.
 
-(iv) tags: use 1 to enable tag-based recall measurement (requires the index to have been built with tags), 0 to disable.
+(iv) tags: controls whether the index translates physical (internal) node IDs to logical (external) IDs using a pre-built tag mapping.
 
-(v) num_nodes_to_cache: our program stores the entire graph on disk. For faster search performance, we provide the support to cache a few nodes (which are closest to the starting point) in memory. Typical values range from 0 (no cache) to 500000 depending on available RAM. For 100M-scale datasets, values of 100000-500000 are recommended.
+  - tags=0 (disabled): search results are returned as **physical node IDs** — the 0-based row index of each point in the original data file. Use this when your dataset IDs are simply 0..N-1 or when no logical ID remapping is needed. This is the typical default.
+  - tags=1 (enabled): each physical node ID is looked up in the `{index_prefix}_disk.index.tags` file, which stores a user-defined logical (external) ID for each point. Results are returned as those logical IDs. This requires the index to have been built with tag support.
+
+  Note: `tags` does *not* refer to a slot/physical ID indicator. Rather it is a per-point user-defined ID that lives alongside the graph. Setting tags=0 means "use the natural physical row index as the ID".
+
+(v) num_nodes_to_cache: the number of graph nodes to pre-load into RAM before any query is processed (offline / pre-query cache). These nodes are selected by breadth-first search (BFS) from the medoid, so the most-visited starting nodes are cached. **Unit: number of graph nodes** (not bytes or sectors).
+
+  - A **cached** node's neighbor list and full coordinates are served entirely from RAM — zero disk I/O.
+  - A **non-cached** node requires a physical disk read (each such read is counted as one entry in `n_ios` / "Mean IOs" in the output table).
+  - Increasing `num_nodes_to_cache` reduces disk I/O and query latency at the cost of higher RAM usage.
+  - To observe the effect on I/O, run the same query set with values such as 0, 10000, 50000, 100000, 500000 and compare the "Mean IOs" and "Mean Latency" columns.
+  - Approximate RAM cost per cached node: `(max_degree + 1) × 4` bytes (neighbor list) + `aligned_dim × sizeof(T)` bytes (coordinates).
+  - Value 0 disables the cache entirely; all node lookups go to disk.
+  - For 100M-scale datasets, 100000–500000 is a good starting range depending on available RAM.
 
 (vi) num_threads: search using specified number of threads in parallel, one thread per query. Use 1 for single-threaded (streaming/sequential) search. More threads will result in higher throughput but also more concurrent IOs; find the balance depending on the SSD bandwidth. For latency-sensitive single-query workloads, use 1.
 
@@ -297,6 +323,42 @@ The arguments are as follows:
 (xii) similarity metric: distance function to use. Supported values: "l2" (Euclidean) or "cosine". Use "l2" for most datasets including Turing-ANNS and SPACEV.
 
 (xiii, xiv, ...) various search_list sizes to perform search with. Larger will result in slower latencies, but higher accuracies. Must be at least the recall@ value in (x).
+
+
+**Output metrics reference for `search_disk_index`**
+=====================================================
+
+The table printed by `search_disk_index` has the following columns:
+
+| Column | Description |
+|--------|-------------|
+| L | ef_search (search list size) |
+| Beamwidth | Optimized or user-supplied beam width |
+| QPS | Queries per second (wall-clock throughput) |
+| Mean Latency (us) | Average per-query latency across all queries |
+| 99.9 Latency (us) | 99.9th-percentile latency |
+| Mean IOs | Average number of disk reads per query (non-cached node accesses) |
+| CPU (s) | Average CPU time per query in microseconds |
+| Recall@K | Recall against the provided ground truth (only shown when a truthset is supplied) |
+
+The per-query `QueryStats` struct (see `include/percentile_stats.h`) records many additional fields that are **collected** during search but **not yet printed** in the current output table:
+
+| Metric | `QueryStats` field | Printed? | Notes |
+|--------|--------------------|----------|-------|
+| Avg / P50 / P99 latency (us) | `total_us` | Partial — mean and P99.9 only | P50 and P99 are not printed |
+| Time cost query planner (ms) | — | ❌ Not tracked | No query planner exists in this code path |
+| Avg n_cmps | `n_cmps` | ❌ Collected but not printed | Distance comparisons per query |
+| Avg n_hops / P50 / P99 n_hops | `n_hops` | ❌ Collected but not printed | Graph traversal iterations per query |
+| Avg nodes_expanded | — | ❌ Not tracked | No dedicated counter |
+| Avg cpu_us / P50 / P99 cpu_us | `cpu_us` | Partial — mean only | P50 and P99 are not printed |
+| Avg io_us / P50 / P99 io_us | `io_us` | ❌ Collected but not printed | Time spent waiting for disk I/O |
+| Cache hits | `n_cache_hits` | ❌ Collected but not printed | In-RAM cache hits per query |
+| Cache misses / Mean IOs | `n_ios` | ✅ Printed as "Mean IOs" | Disk reads = cache misses |
+| Cache hit rate | derivable: `n_cache_hits / (n_cache_hits + n_ios)` | ❌ Not printed | |
+| Total sectors read | `n_4k` | ❌ Collected but not printed | 4 KB sector reads |
+| Total bytes read | `read_size` | ❌ Collected but not printed | |
+
+**Summary**: the fields `n_cmps`, `n_hops`, `io_us`, `cpu_us` percentiles, `n_cache_hits`, `n_4k`, and `read_size` are all captured by `cached_beam_search` via `QueryStats`, and can be surfaced using the existing `get_mean_stats` / `get_percentile_stats` helpers — but they are not printed in the current output.
 
 
 **Recommended parameters for large-scale datasets**

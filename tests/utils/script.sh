@@ -37,7 +37,7 @@ cp ${WORKING_PATH}/${INDEX_FILE}_cycle_0* $SAVE_PATH/base_copy/
 #./tests/utils/compute_groundtruth float $BASE_FILE $QUERY_FILE 500 $GT_FILE
 
 # search on base index
-numactl --interleave=all ./tests/search_disk_index float $WORKING_PATH/${INDEX_FILE}_cycle_0 100000 32 4 $QUERY_FILE $GT_FILE 10 /tmp/abc 100 2>&1 0</dev/null 1>${LOGFILE}_search.log
+numactl --interleave=all ./tests/search_disk_index float $WORKING_PATH/${INDEX_FILE}_cycle_0 0 0 100000 32 4 $QUERY_FILE $GT_FILE 10 /tmp/abc l2 100 2>&1 0</dev/null 1>${LOGFILE}_search.log
 
 for (( c=0; c<$NUM_CYCLES; c++ ))
 do
@@ -48,7 +48,7 @@ do
 	numactl --interleave=all ./tests/build_memory_index float $WORKING_PATH/${INDEX_FILE}_cycle_${nextc}_mem_1.data $WORKING_PATH/${INDEX_FILE}_cycle_${nextc}_mem_1.index 64 75 1.2 64
 	cp $WORKING_PATH/${INDEX_FILE}_cycle_${nextc}_mem_1.tags $WORKING_PATH/${INDEX_FILE}_cycle_${nextc}_mem_1.index.tags 2>&1 0</dev/null 1>>${LOGFILE}_build.log
 	/usr/bin/time numactl --interleave=all ./tests/test_index_merger float $WORKING_PATH/${INDEX_FILE}_cycle_${c} $WORKING_PATH/${INDEX_FILE}_cycle_${nextc} $WORKING_PATH/${INDEX_FILE}_deleted.tags_cycle_${nextc} 128 4 64 70 1.2 1000 $WORKING_PATH $WORKING_PATH/${INDEX_FILE}_cycle_${nextc}_mem_1.index 2>&1 0</dev/null 1>>${LOGFILE}_build.log
-	numactl --interleave=all ./tests/search_disk_index float $WORKING_PATH/${INDEX_FILE}_cycle_${nextc} 100000 32 4 $QUERY_FILE $GT_FILE 10 /tmp/def 100 2>&1 0</dev/null 1>>${LOGFILE}_search.log
+	numactl --interleave=all ./tests/search_disk_index float $WORKING_PATH/${INDEX_FILE}_cycle_${nextc} 0 0 100000 32 4 $QUERY_FILE $GT_FILE 10 /tmp/def l2 100 2>&1 0</dev/null 1>>${LOGFILE}_search.log
 	sudo rm -rf  $WORKING_PATH/${INDEX_FILE}_cycle_${c}_* 
 	rm -rf $SAVE_PATH/${INDEX_FILE}_cycle_${c}_*
 	cp $WORKING_PATH/${INDEX_FILE}_cycle_${nextc}* $SAVE_PATH/

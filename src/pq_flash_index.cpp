@@ -1100,6 +1100,7 @@ namespace diskann {
           if (stats != nullptr) {
             stats->n_4k++;
             stats->n_ios++;
+            stats->read_size += SECTOR_LEN;
           }
           num_ios++;
         }
@@ -1239,9 +1240,6 @@ namespace diskann {
             visited.insert(id);
             cmps++;
             float dist = dist_scratch[m];
-            if (stats != nullptr) {
-              stats->n_cmps++;
-            }
             if (dist >= retset[cur_list_size - 1].distance &&
                 (cur_list_size == l_search))
               continue;

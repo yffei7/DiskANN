@@ -107,7 +107,7 @@ The arguments are as follows:
   - A **cached** node's neighbor list and full coordinates are served entirely from RAM — zero disk I/O.
   - A **non-cached** node requires a physical disk read (each such read is counted as one entry in `n_ios` / "Mean IOs" in the output table).
   - Increasing `num_nodes_to_cache` reduces disk I/O and query latency at the cost of higher RAM usage.
-  - To observe the effect on I/O, run the same query set with values such as 0, 10000, 50000, 100000, 500000 and compare the "Mean IOs" and "Mean Latency" columns.
+  - To observe the effect on I/O, run the same query set with values such as 0, 10000, 50000, 100000, 500000 and compare "Total sectors", "Bytes read", "Avg io_us", and "Cache hit rate" in the output (or use `scripts/run_cache_sweep.sh` which loops over these values automatically).
   - Approximate RAM cost per cached node: `(max_degree + 1) × 4` bytes (neighbor list) + `aligned_dim × sizeof(T)` bytes (coordinates).
   - Value 0 disables the cache entirely; all node lookups go to disk.
   - For 100M-scale datasets, 100000–500000 is a good starting range depending on available RAM.
@@ -303,7 +303,7 @@ The arguments are as follows:
   - A **cached** node's neighbor list and full coordinates are served entirely from RAM — zero disk I/O.
   - A **non-cached** node requires a physical disk read (each such read is counted as one entry in `n_ios` / "Mean IOs" in the output table).
   - Increasing `num_nodes_to_cache` reduces disk I/O and query latency at the cost of higher RAM usage.
-  - To observe the effect on I/O, run the same query set with values such as 0, 10000, 50000, 100000, 500000 and compare the "Mean IOs" and "Mean Latency" columns.
+  - To observe the effect on I/O, run the same query set with values such as 0, 10000, 50000, 100000, 500000 and compare "Total sectors", "Bytes read", "Avg io_us", and "Cache hit rate" in the output (or use `scripts/run_cache_sweep.sh` which loops over these values automatically).
   - Approximate RAM cost per cached node: `(max_degree + 1) × 4` bytes (neighbor list) + `aligned_dim × sizeof(T)` bytes (coordinates).
   - Value 0 disables the cache entirely; all node lookups go to disk.
   - For 100M-scale datasets, 100000–500000 is a good starting range depending on available RAM.
@@ -328,37 +328,49 @@ The arguments are as follows:
 **Output metrics reference for `search_disk_index`**
 =====================================================
 
-The table printed by `search_disk_index` has the following columns:
+For each L (search list size) value, `search_disk_index` prints a block of the form:
 
-| Column | Description |
-|--------|-------------|
-| L | ef_search (search list size) |
-| Beamwidth | Optimized or user-supplied beam width |
-| QPS | Queries per second (wall-clock throughput) |
-| Mean Latency (us) | Average per-query latency across all queries |
-| 99.9 Latency (us) | 99.9th-percentile latency |
-| Mean IOs | Average number of disk reads per query (non-cached node accesses) |
-| CPU (s) | Average CPU time per query in microseconds |
-| Recall@K | Recall against the provided ground truth (only shown when a truthset is supplied) |
+```
+=== L=<L>, Beamwidth=<B> ===
+- Time cost (us):           <total wall-clock time for all queries>
+- QPS:                      <queries per second>
+- Recall@K:                 <recall against ground truth (only with truthset)>
+- Avg latency (us):         <mean per-query latency>
+- P50 latency (us):         <median per-query latency>
+- P99 latency (us):         <99th-percentile per-query latency>
+- Avg io_us:                <mean time spent in disk I/O per query>
+- P50 io_us:                <median disk I/O time>
+- P99 io_us:                <99th-percentile disk I/O time>
+- Avg cpu_us:               <mean CPU time per query>
+- P50 cpu_us:               <median CPU time>
+- P99 cpu_us:               <99th-percentile CPU time>
+- Avg n_cmps:               <mean PQ distance comparisons per query>
+- Avg n_hops:               <mean beam-search iterations per query>
+- P50 n_hops:               <median beam-search iterations>
+- P99 n_hops:               <99th-percentile beam-search iterations>
+- Cache hits:               <total in-RAM cache hits across all queries>
+- Cache hit rate:           <hits / (hits + disk reads) × 100>%
+- Total sectors:            <total 4 KB sectors read from disk>
+- Bytes read:               <total bytes read from disk (sectors × 4096)>
+```
 
-The per-query `QueryStats` struct (see `include/percentile_stats.h`) records many additional fields that are **collected** during search but **not yet printed** in the current output table:
+`QueryStats` fields that are **not tracked** (no counter exists):
+- Time cost query planner — no query planner in the disk search path
+- Avg nodes_expanded — no dedicated counter
 
-| Metric | `QueryStats` field | Printed? | Notes |
-|--------|--------------------|----------|-------|
-| Avg / P50 / P99 latency (us) | `total_us` | Partial — mean and P99.9 only | P50 and P99 are not printed |
-| Time cost query planner (ms) | — | ❌ Not tracked | No query planner exists in this code path |
-| Avg n_cmps | `n_cmps` | ❌ Collected but not printed | Distance comparisons per query |
-| Avg n_hops / P50 / P99 n_hops | `n_hops` | ❌ Collected but not printed | Graph traversal iterations per query |
-| Avg nodes_expanded | — | ❌ Not tracked | No dedicated counter |
-| Avg cpu_us / P50 / P99 cpu_us | `cpu_us` | Partial — mean only | P50 and P99 are not printed |
-| Avg io_us / P50 / P99 io_us | `io_us` | ❌ Collected but not printed | Time spent waiting for disk I/O |
-| Cache hits | `n_cache_hits` | ❌ Collected but not printed | In-RAM cache hits per query |
-| Cache misses / Mean IOs | `n_ios` | ✅ Printed as "Mean IOs" | Disk reads = cache misses |
-| Cache hit rate | derivable: `n_cache_hits / (n_cache_hits + n_ios)` | ❌ Not printed | |
-| Total sectors read | `n_4k` | ❌ Collected but not printed | 4 KB sector reads |
-| Total bytes read | `read_size` | ❌ Collected but not printed | |
+**Cache sweep script**
 
-**Summary**: the fields `n_cmps`, `n_hops`, `io_us`, `cpu_us` percentiles, `n_cache_hits`, `n_4k`, and `read_size` are all captured by `cached_beam_search` via `QueryStats`, and can be surfaced using the existing `get_mean_stats` / `get_percentile_stats` helpers — but they are not printed in the current output.
+To measure how `num_nodes_to_cache` affects disk I/O and latency, use:
+
+```bash
+bash scripts/run_cache_sweep.sh <index_type> <index_prefix> <query_file> \
+    <result_prefix> [truthset] [K] [beamwidth] [threads] [similarity] [L1] [L2] ...
+```
+
+The script automatically runs `search_disk_index` for each cache size in
+`{10000, 50000, 100000, 500000, 100000000}` and prints the full metric block for
+each run, making it easy to compare "Total sectors", "Bytes read", "Avg io_us",
+and "Cache hit rate" across cache sizes.
 
 
 **Recommended parameters for large-scale datasets**

@@ -107,7 +107,7 @@ The arguments are as follows:
   - A **cached** node's neighbor list and full coordinates are served entirely from RAM — zero disk I/O.
   - A **non-cached** node requires a physical disk read (each such read is counted as one entry in `n_ios` / "Mean IOs" in the output table).
   - Increasing `num_nodes_to_cache` reduces disk I/O and query latency at the cost of higher RAM usage.
-  - To observe the effect on I/O, run the same query set with values such as 0, 10000, 50000, 100000, 500000 and compare "Total sectors", "Bytes read", "Avg io_us", and "Cache hit rate" in the output (or use `scripts/run_cache_sweep.sh` which loops over these values automatically).
+  - To observe the effect on I/O, run the same query set with values such as 0, 10000, 50000, 100000, 500000 and compare "Total sectors", "Avg io_us", and "Cache hit rate" in the output (or use `scripts/run_disk_experiments.sh` which sweeps cache sizes across all configured datasets automatically).
   - Approximate RAM cost per cached node: `(max_degree + 1) × 4` bytes (neighbor list) + `aligned_dim × sizeof(T)` bytes (coordinates).
   - Value 0 disables the cache entirely; all node lookups go to disk.
   - For 100M-scale datasets, 100000–500000 is a good starting range depending on available RAM.
@@ -303,7 +303,7 @@ The arguments are as follows:
   - A **cached** node's neighbor list and full coordinates are served entirely from RAM — zero disk I/O.
   - A **non-cached** node requires a physical disk read (each such read is counted as one entry in `n_ios` / "Mean IOs" in the output table).
   - Increasing `num_nodes_to_cache` reduces disk I/O and query latency at the cost of higher RAM usage.
-  - To observe the effect on I/O, run the same query set with values such as 0, 10000, 50000, 100000, 500000 and compare "Total sectors", "Bytes read", "Avg io_us", and "Cache hit rate" in the output (or use `scripts/run_cache_sweep.sh` which loops over these values automatically).
+  - To observe the effect on I/O, run the same query set with values such as 0, 10000, 50000, 100000, 500000 and compare "Total sectors", "Avg io_us", and "Cache hit rate" in the output (or use `scripts/run_disk_experiments.sh` which sweeps cache sizes across all configured datasets automatically).
   - Approximate RAM cost per cached node: `(max_degree + 1) × 4` bytes (neighbor list) + `aligned_dim × sizeof(T)` bytes (coordinates).
   - Value 0 disables the cache entirely; all node lookups go to disk.
   - For 100M-scale datasets, 100000–500000 is a good starting range depending on available RAM.
@@ -350,27 +350,23 @@ For each L (search list size) value, `search_disk_index` prints a block of the f
 - P99 n_hops:               <99th-percentile beam-search iterations>
 - Cache hits:               <total in-RAM cache hits across all queries>
 - Cache hit rate:           <hits / (hits + disk reads) × 100>%
-- Total sectors:            <total 4 KB sectors read from disk>
-- Bytes read:               <total bytes read from disk (sectors × 4096)>
+- Total sectors:            <total 4 KB sectors read from disk (= n_4k)>
 ```
 
-`QueryStats` fields that are **not tracked** (no counter exists):
-- Time cost query planner — no query planner in the disk search path
-- Avg nodes_expanded — no dedicated counter
+**Experiment script**
 
-**Cache sweep script**
-
-To measure how `num_nodes_to_cache` affects disk I/O and latency, use:
+`scripts/run_disk_experiments.sh` runs every configured dataset across all cache
+sizes in one go.  Edit the arrays at the top of the script to match your paths:
 
 ```bash
-bash scripts/run_cache_sweep.sh <index_type> <index_prefix> <query_file> \
-    <result_prefix> [truthset] [K] [beamwidth] [threads] [similarity] [L1] [L2] ...
+bash scripts/run_disk_experiments.sh          # search only
+bash scripts/run_disk_experiments.sh --build  # build index then search
 ```
 
-The script automatically runs `search_disk_index` for each cache size in
-`{10000, 50000, 100000, 500000, 100000000}` and prints the full metric block for
-each run, making it easy to compare "Total sectors", "Bytes read", "Avg io_us",
-and "Cache hit rate" across cache sizes.
+The script loops: `for each dataset × for each cache_size in {10000, 50000, 100000, 500000, 100000000}`.
+Each dataset has its own `index_type`, `similarity`, `K`, `beamwidth`, and `L` values.
+Add more datasets by extending the `DATASETS` array and the corresponding
+per-dataset config maps at the top of the script.
 
 
 **Recommended parameters for large-scale datasets**
@@ -380,7 +376,7 @@ The following are recommended starting-point parameters for common benchmark dat
 
 **arXiv float32** (10,000 points, dimension 768, float32, L2):
 - Build: `R=64 L=100 B=1 M=8 T=8 similarity=l2 single_file_index=0`
-- Search (single-threaded): `num_nodes_to_cache=5000 num_threads=1 beamwidth=4 K=10 metric=l2`
+- Search (single-threaded): `num_nodes_to_cache=5000 num_threads=1 beamwidth=4 K=10 similarity=l2`
   ```
   ./tests/build_disk_index float arxiv_data.bin arxiv_index 64 100 1 8 8 l2 0
   ./tests/search_disk_index float arxiv_index 0 0 5000 1 4 arxiv_queries.bin null 10 arxiv_results l2 50 75 100
@@ -389,7 +385,7 @@ The following are recommended starting-point parameters for common benchmark dat
 **Microsoft Turing-ANNS 100M** (100M points, dimension 100, float32, L2):
 - Build: `R=64 L=100 B=100 M=200 T=64 similarity=l2 single_file_index=0`
   (B=100 sets a 100 GB RAM budget for the in-memory portion of the search index; M=200 limits RAM used during build to 200 GB. Reduce if your machine has less RAM.)
-- Search (single-threaded): `num_nodes_to_cache=500000 num_threads=1 beamwidth=4 K=10 metric=l2`
+- Search (single-threaded): `num_nodes_to_cache=500000 num_threads=1 beamwidth=4 K=10 similarity=l2`
   ```
   ./tests/build_disk_index float turing_data.bin turing_index 64 100 100 200 64 l2 0
   ./tests/search_disk_index float turing_index 0 0 500000 1 4 turing_queries.bin turing_gt.bin 10 turing_results l2 100 150 200
@@ -398,7 +394,7 @@ The following are recommended starting-point parameters for common benchmark dat
 **Microsoft SPACEV 100M** (100M points, dimension 100, int8, L2):
 - Build: `R=64 L=100 B=20 M=64 T=64 similarity=l2 single_file_index=0`
   (B=20 sets a 20 GB RAM budget; M=64 limits RAM used during build to 64 GB. Adjust based on your machine.)
-- Search (single-threaded): `num_nodes_to_cache=500000 num_threads=1 beamwidth=4 K=10 metric=l2`
+- Search (single-threaded): `num_nodes_to_cache=500000 num_threads=1 beamwidth=4 K=10 similarity=l2`
   ```
   ./tests/build_disk_index int8 spacev_data.bin spacev_index 64 100 20 64 64 l2 0
   ./tests/search_disk_index int8 spacev_index 0 0 500000 1 4 spacev_queries.bin spacev_gt.bin 10 spacev_results l2 100 150 200

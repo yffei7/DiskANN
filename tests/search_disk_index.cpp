@@ -290,13 +290,11 @@ int search_disk_index(int argc, char** argv) {
         stats, query_num, 0.99f,
         [](const diskann::QueryStats& s) { return s.n_hops; });
 
-    double total_cache_hits = 0, total_ios = 0, total_sectors = 0,
-           total_bytes = 0;
+    double total_cache_hits = 0, total_ios = 0, total_sectors = 0;
     for (uint64_t i = 0; i < query_num; i++) {
       total_cache_hits += stats[i].n_cache_hits;
       total_ios += stats[i].n_ios;
       total_sectors += stats[i].n_4k;
-      total_bytes += stats[i].read_size;
     }
     double hit_rate = (total_cache_hits + total_ios > 0)
                           ? 100.0 * total_cache_hits /
@@ -355,9 +353,6 @@ int search_disk_index(int argc, char** argv) {
                   << std::right << hit_rate << "%\n";
     diskann::cout << std::setw(28) << std::left << "- Total sectors:"
                   << std::right << (uint64_t) total_sectors << "\n";
-    diskann::cout << std::setw(28) << std::left << "- Bytes read:"
-                  << std::right << (uint64_t) total_bytes << " ("
-                  << (total_bytes / (1024.0 * 1024.0)) << " MB)\n";
   }
   std::this_thread::sleep_for(std::chrono::seconds(10));
 

@@ -1100,7 +1100,6 @@ namespace diskann {
           if (stats != nullptr) {
             stats->n_4k++;
             stats->n_ios++;
-            stats->read_size += SECTOR_LEN;
           }
           num_ios++;
         }

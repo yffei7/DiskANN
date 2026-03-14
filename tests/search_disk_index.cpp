@@ -202,18 +202,6 @@ int search_disk_index(int argc, char** argv) {
   diskann::cout.precision(2);
 
   std::string recall_string = "Recall@" + std::to_string(recall_at);
-  diskann::cout << std::setw(6) << "L" << std::setw(12) << "Beamwidth"
-                << std::setw(16) << "QPS" << std::setw(16) << "Mean Latency"
-                << std::setw(16) << "99.9 Latency" << std::setw(16)
-                << "Mean IOs" << std::setw(16) << "CPU (s)";
-  if (calc_recall_flag) {
-    diskann::cout << std::setw(16) << recall_string << std::endl;
-  } else
-    diskann::cout << std::endl;
-  diskann::cout
-      << "==============================================================="
-         "==========================================="
-      << std::endl;
 
   std::vector<std::vector<uint32_t>> query_result_ids(Lvec.size());
   std::vector<std::vector<uint32_t>> query_result_tags(Lvec.size());
@@ -260,27 +248,59 @@ int search_disk_index(int argc, char** argv) {
 
     float mean_latency = (float) diskann::get_mean_stats(
         stats, query_num,
-        [](const diskann::QueryStats& stats) { return stats.total_us; });
+        [](const diskann::QueryStats& s) { return s.total_us; });
+    float p50_latency = (float) diskann::get_percentile_stats(
+        stats, query_num, 0.50f,
+        [](const diskann::QueryStats& s) { return s.total_us; });
+    float p99_latency = (float) diskann::get_percentile_stats(
+        stats, query_num, 0.99f,
+        [](const diskann::QueryStats& s) { return s.total_us; });
 
-    /*    float latency_90 = (float) diskann::get_percentile_stats(
-            stats, query_num, 0.900,
-            [](const diskann::QueryStats& stats) { return stats.total_us; });
-
-        float latency_95 = (float) diskann::get_percentile_stats(
-            stats, query_num, 0.950,
-            [](const diskann::QueryStats& stats) { return stats.total_us; });
-    */
-    float latency_999 = (float) diskann::get_percentile_stats(
-        stats, query_num, 0.999f,
-        [](const diskann::QueryStats& stats) { return stats.total_us; });
-
-    float mean_ios = (float) diskann::get_mean_stats(
+    float mean_io_us = (float) diskann::get_mean_stats(
         stats, query_num,
-        [](const diskann::QueryStats& stats) { return stats.n_ios; });
+        [](const diskann::QueryStats& s) { return s.io_us; });
+    float p50_io_us = (float) diskann::get_percentile_stats(
+        stats, query_num, 0.50f,
+        [](const diskann::QueryStats& s) { return s.io_us; });
+    float p99_io_us = (float) diskann::get_percentile_stats(
+        stats, query_num, 0.99f,
+        [](const diskann::QueryStats& s) { return s.io_us; });
 
-    float mean_cpuus = (float) diskann::get_mean_stats(
+    float mean_cpu_us = (float) diskann::get_mean_stats(
         stats, query_num,
-        [](const diskann::QueryStats& stats) { return stats.cpu_us; });
+        [](const diskann::QueryStats& s) { return s.cpu_us; });
+    float p50_cpu_us = (float) diskann::get_percentile_stats(
+        stats, query_num, 0.50f,
+        [](const diskann::QueryStats& s) { return s.cpu_us; });
+    float p99_cpu_us = (float) diskann::get_percentile_stats(
+        stats, query_num, 0.99f,
+        [](const diskann::QueryStats& s) { return s.cpu_us; });
+
+    float mean_cmps = (float) diskann::get_mean_stats(
+        stats, query_num,
+        [](const diskann::QueryStats& s) { return s.n_cmps; });
+
+    float mean_hops = (float) diskann::get_mean_stats(
+        stats, query_num,
+        [](const diskann::QueryStats& s) { return s.n_hops; });
+    float p50_hops = (float) diskann::get_percentile_stats(
+        stats, query_num, 0.50f,
+        [](const diskann::QueryStats& s) { return s.n_hops; });
+    float p99_hops = (float) diskann::get_percentile_stats(
+        stats, query_num, 0.99f,
+        [](const diskann::QueryStats& s) { return s.n_hops; });
+
+    double total_cache_hits = 0, total_ios = 0, total_sectors = 0;
+    for (uint64_t i = 0; i < query_num; i++) {
+      total_cache_hits += stats[i].n_cache_hits;
+      total_ios += stats[i].n_ios;
+      total_sectors += stats[i].n_4k;
+    }
+    double hit_rate = (total_cache_hits + total_ios > 0)
+                          ? 100.0 * total_cache_hits /
+                                (total_cache_hits + total_ios)
+                          : 0.0;
+
     delete[] stats;
 
     float recall = 0;
@@ -291,13 +311,48 @@ int search_disk_index(int argc, char** argv) {
           (_u32) recall_at);
     }
 
-    diskann::cout << std::setw(6) << L << std::setw(12) << optimized_beamwidth
-                  << std::setw(16) << qps << std::setw(16) << mean_latency
-                  << std::setw(16) << latency_999 << std::setw(16) << mean_ios
-                  << std::setw(16) << mean_cpuus;
-    if (calc_recall_flag) {
-      diskann::cout << std::setw(16) << recall << std::endl;
-    }
+    diskann::cout << "\n=== L=" << L
+                  << ", Beamwidth=" << optimized_beamwidth << " ===\n";
+    diskann::cout << std::setw(28) << std::left << "- Time cost (us):"
+                  << std::right << (uint64_t)(diff.count() * 1e6) << "\n";
+    diskann::cout << std::setw(28) << std::left << "- QPS:" << std::right
+                  << qps << "\n";
+    if (calc_recall_flag)
+      diskann::cout << std::setw(28) << std::left
+                    << "- " + recall_string + ":" << std::right << recall
+                    << "\n";
+    diskann::cout << std::setw(28) << std::left << "- Avg latency (us):"
+                  << std::right << mean_latency << "\n";
+    diskann::cout << std::setw(28) << std::left << "- P50 latency (us):"
+                  << std::right << p50_latency << "\n";
+    diskann::cout << std::setw(28) << std::left << "- P99 latency (us):"
+                  << std::right << p99_latency << "\n";
+    diskann::cout << std::setw(28) << std::left << "- Avg io_us:"
+                  << std::right << mean_io_us << "\n";
+    diskann::cout << std::setw(28) << std::left << "- P50 io_us:"
+                  << std::right << p50_io_us << "\n";
+    diskann::cout << std::setw(28) << std::left << "- P99 io_us:"
+                  << std::right << p99_io_us << "\n";
+    diskann::cout << std::setw(28) << std::left << "- Avg cpu_us:"
+                  << std::right << mean_cpu_us << "\n";
+    diskann::cout << std::setw(28) << std::left << "- P50 cpu_us:"
+                  << std::right << p50_cpu_us << "\n";
+    diskann::cout << std::setw(28) << std::left << "- P99 cpu_us:"
+                  << std::right << p99_cpu_us << "\n";
+    diskann::cout << std::setw(28) << std::left << "- Avg n_cmps:"
+                  << std::right << mean_cmps << "\n";
+    diskann::cout << std::setw(28) << std::left << "- Avg n_hops:"
+                  << std::right << mean_hops << "\n";
+    diskann::cout << std::setw(28) << std::left << "- P50 n_hops:"
+                  << std::right << p50_hops << "\n";
+    diskann::cout << std::setw(28) << std::left << "- P99 n_hops:"
+                  << std::right << p99_hops << "\n";
+    diskann::cout << std::setw(28) << std::left << "- Cache hits:"
+                  << std::right << (uint64_t) total_cache_hits << "\n";
+    diskann::cout << std::setw(28) << std::left << "- Cache hit rate:"
+                  << std::right << hit_rate << "%\n";
+    diskann::cout << std::setw(28) << std::left << "- Total sectors:"
+                  << std::right << (uint64_t) total_sectors << "\n";
   }
   std::this_thread::sleep_for(std::chrono::seconds(10));
 

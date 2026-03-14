@@ -84,7 +84,7 @@ To search the SSD-index, use the `tests/search_disk_index` program.
 ----------------------------------------------------------------------------
 
 ```
-./tests/search_disk_index  [index_type<float/int8/uint8>]  [index_prefix_path]  [num_nodes_to_cache]  [num_threads]  [beamwidth (use 0 to optimize internally)]  [query_file.bin]  [truthset.bin (use "null" for none)]  [K]  [result_output_prefix]  [L1]  [L2] etc.
+./tests/search_disk_index  [index_type<float/int8/uint8>]  [index_prefix_path]  [single_file_index(0/1)]  [tags(0/1)]  [num_nodes_to_cache]  [num_threads]  [beamwidth (use 0 to optimize internally)]  [query_file.bin]  [truthset.bin (use "null" for none)]  [K]  [result_output_prefix]  [similarity metric (cosine/l2)]  [L1]  [L2] etc.
 ```
 
 The arguments are as follows:
@@ -93,21 +93,40 @@ The arguments are as follows:
 
 (ii) index_prefix_path: same as (iii) above in building index.
 
-(iii) num_nodes_to_cache: our program stores the entire graph on disk. For faster search performance, we provide the support to cache a few nodes (which are closest to the starting point) in memory. 
+(iii) single_file_index: use 1 if the index was built with the single-file format (see `single_file_index` flag in `build_disk_index`), 0 otherwise.
 
-(iv) num_threads: search using specified number of threads in parallel, one thread per query. More will result in more IOs, so find the balance depending on the bandwidth of the SSD.
+(iv) tags: controls whether the index translates physical (internal) node IDs to logical (external) IDs using a pre-built tag mapping.
 
-(v) beamwidth: maximum number of IO requests each query will issue per iteration of search code. Larger beamwidth williult in fewer IO round-trips per query, but might result in slightly higher number of IO requests to SSD per query. Specifying 0 will optimize the beamwidth depending on the number of threads performing search.
+  - tags=0 (disabled): search results are returned as **physical node IDs** — the 0-based row index of each point in the original data file. Use this when your dataset IDs are simply 0..N-1 or when no logical ID remapping is needed. This is the typical default.
+  - tags=1 (enabled): each physical node ID is looked up in the `{index_prefix}_disk.index.tags` file, which stores a user-defined logical (external) ID for each point. Results are returned as those logical IDs. This requires the index to have been built with tag support.
 
-(vi) query_file.bin: search on these queries, same format as data file (ii) above. The query file must be the same type as specified in (i).
+  Note: `tags` does *not* refer to a slot/physical ID indicator. Rather it is a per-point user-defined ID that lives alongside the graph. Setting tags=0 means "use the natural physical row index as the ID".
 
-(vii) truthset.bin file. Must be in the following format, or specify "null": n, the number of queries (4 bytes) followed by d, the number of ground truth elements per query (4 bytes), followed by n*d entries per query representing the d closest IDs per query in integer format,  followed by n*d entries representing the corresponding distances (float). Total file size is 8 + 4*n*d + 4*n*d. The groundtruth file, if not available, can be calculated using our program, tests/utils/compute_groundtruth. If you just want to measure the latency numbers of search and output the nearest neighbors without calculating recall, enter "null".
+(v) num_nodes_to_cache: the number of graph nodes to pre-load into RAM before any query is processed (offline / pre-query cache). These nodes are selected by breadth-first search (BFS) from the medoid, so the most-visited starting nodes are cached. **Unit: number of graph nodes** (not bytes or sectors).
 
-(viii) K: measure recall@k, meaning the accuracy of retrieving top-k nearest neighbors.
+  - A **cached** node's neighbor list and full coordinates are served entirely from RAM — zero disk I/O.
+  - A **non-cached** node requires a physical disk read (each such read is counted as one entry in `n_ios` / "Mean IOs" in the output table).
+  - Increasing `num_nodes_to_cache` reduces disk I/O and query latency at the cost of higher RAM usage.
+  - To observe the effect on I/O, run the same query set with values such as 0, 10000, 50000, 100000, 500000 and compare "Total sectors", "Avg io_us", and "Cache hit rate" in the output (or use `scripts/run_disk_experiments.sh` which sweeps cache sizes across all configured datasets automatically).
+  - Approximate RAM cost per cached node: `(max_degree + 1) × 4` bytes (neighbor list) + `aligned_dim × sizeof(T)` bytes (coordinates).
+  - Value 0 disables the cache entirely; all node lookups go to disk.
+  - For 100M-scale datasets, 100000–500000 is a good starting range depending on available RAM.
 
-(ix) result output prefix: search results will be stored in files with specified prefix, in bin format.
+(vi) num_threads: search using specified number of threads in parallel, one thread per query. Use 1 for single-threaded (streaming/sequential) search. More threads will result in higher throughput but also more concurrent IOs; find the balance depending on the SSD bandwidth. For latency-sensitive single-query workloads, use 1.
 
-(x, xi, ...) various search_list sizes to perform search with. Larger will result in slower latencies, but higher accuracies. Must be atleast the recall@ value in (vi).
+(vii) beamwidth: maximum number of IO requests each query will issue per iteration of search code. Larger beamwidth will result in fewer IO round-trips per query, but might result in slightly higher number of IO requests to SSD per query. Specifying 0 will optimize the beamwidth depending on the number of threads performing search. For single-threaded search, a value of 2-4 is typically good.
+
+(viii) query_file.bin: search on these queries, same format as data file (ii) above. The query file must be the same type as specified in (i).
+
+(ix) truthset.bin file. Must be in the following format, or specify "null": n, the number of queries (4 bytes) followed by d, the number of ground truth elements per query (4 bytes), followed by n*d entries per query representing the d closest IDs per query in integer format,  followed by n*d entries representing the corresponding distances (float). Total file size is 8 + 4*n*d + 4*n*d. The groundtruth file, if not available, can be calculated using our program, tests/utils/compute_groundtruth. If you just want to measure the latency numbers of search and output the nearest neighbors without calculating recall, enter "null".
+
+(x) K: measure recall@k, meaning the accuracy of retrieving top-k nearest neighbors.
+
+(xi) result output prefix: search results will be stored in files with specified prefix, in bin format.
+
+(xii) similarity metric: distance function to use. Supported values: "l2" (Euclidean) or "cosine". Use "l2" for most datasets including Turing-ANNS and SPACEV.
+
+(xiii, xiv, ...) various search_list sizes to perform search with. Larger will result in slower latencies, but higher accuracies. Must be at least the recall@ value in (x).
 
 
 **Usage for in-memory indices**
@@ -261,7 +280,7 @@ To search the SSD-index, use the `tests/search_disk_index` program.
 ----------------------------------------------------------------------------
 
 ```
-./tests/search_disk_index  [index_type<float/int8/uint8>]  [index_prefix_path]  [num_nodes_to_cache]  [num_threads]  [beamwidth (use 0 to optimize internally)]  [query_file.bin]  [truthset.bin (use "null" for none)]  [K]  [result_output_prefix]  [L1]  [L2] etc.
+./tests/search_disk_index  [index_type<float/int8/uint8>]  [index_prefix_path]  [single_file_index(0/1)]  [tags(0/1)]  [num_nodes_to_cache]  [num_threads]  [beamwidth (use 0 to optimize internally)]  [query_file.bin]  [truthset.bin (use "null" for none)]  [K]  [result_output_prefix]  [similarity metric (cosine/l2)]  [L1]  [L2] etc.
 ```
 
 The arguments are as follows:
@@ -270,21 +289,119 @@ The arguments are as follows:
 
 (ii) index_prefix_path: same as (iii) above in building index.
 
-(iii) num_nodes_to_cache: our program stores the entire graph on disk. For faster search performance, we provide the support to cache a few nodes (which are closest to the starting point) in memory. 
+(iii) single_file_index: use 1 if the index was built with the single-file format (see `single_file_index` flag in `build_disk_index`), 0 otherwise.
 
-(iv) num_threads: search using specified number of threads in parallel, one thread per query. More will result in more IOs, so find the balance depending on the bandwidth of the SSD.
+(iv) tags: controls whether the index translates physical (internal) node IDs to logical (external) IDs using a pre-built tag mapping.
 
-(v) beamwidth: maximum number of IO requests each query will issue per iteration of search code. Larger beamwidth williult in fewer IO round-trips per query, but might result in slightly higher number of IO requests to SSD per query. Specifying 0 will optimize the beamwidth depending on the number of threads performing search.
+  - tags=0 (disabled): search results are returned as **physical node IDs** — the 0-based row index of each point in the original data file. Use this when your dataset IDs are simply 0..N-1 or when no logical ID remapping is needed. This is the typical default.
+  - tags=1 (enabled): each physical node ID is looked up in the `{index_prefix}_disk.index.tags` file, which stores a user-defined logical (external) ID for each point. Results are returned as those logical IDs. This requires the index to have been built with tag support.
 
-(vi) query_file.bin: search on these queries, same format as data file (ii) above. The query file must be the same type as specified in (i).
+  Note: `tags` does *not* refer to a slot/physical ID indicator. Rather it is a per-point user-defined ID that lives alongside the graph. Setting tags=0 means "use the natural physical row index as the ID".
 
-(vii) truthset.bin file. Must be in the following format, or specify "null": n, the number of queries (4 bytes) followed by d, the number of ground truth elements per query (4 bytes), followed by n*d entries per query representing the d closest IDs per query in integer format,  followed by n*d entries representing the corresponding distances (float). Total file size is 8 + 4*n*d + 4*n*d. The groundtruth file, if not available, can be calculated using our program, tests/utils/compute_groundtruth. If you just want to measure the latency numbers of search and output the nearest neighbors without calculating recall, enter "null".
+(v) num_nodes_to_cache: the number of graph nodes to pre-load into RAM before any query is processed (offline / pre-query cache). These nodes are selected by breadth-first search (BFS) from the medoid, so the most-visited starting nodes are cached. **Unit: number of graph nodes** (not bytes or sectors).
 
-(viii) K: measure recall@k, meaning the accuracy of retrieving top-k nearest neighbors.
+  - A **cached** node's neighbor list and full coordinates are served entirely from RAM — zero disk I/O.
+  - A **non-cached** node requires a physical disk read (each such read is counted as one entry in `n_ios` / "Mean IOs" in the output table).
+  - Increasing `num_nodes_to_cache` reduces disk I/O and query latency at the cost of higher RAM usage.
+  - To observe the effect on I/O, run the same query set with values such as 0, 10000, 50000, 100000, 500000 and compare "Total sectors", "Avg io_us", and "Cache hit rate" in the output (or use `scripts/run_disk_experiments.sh` which sweeps cache sizes across all configured datasets automatically).
+  - Approximate RAM cost per cached node: `(max_degree + 1) × 4` bytes (neighbor list) + `aligned_dim × sizeof(T)` bytes (coordinates).
+  - Value 0 disables the cache entirely; all node lookups go to disk.
+  - For 100M-scale datasets, 100000–500000 is a good starting range depending on available RAM.
 
-(ix) result output prefix: search results will be stored in files with specified prefix, in bin format.
+(vi) num_threads: search using specified number of threads in parallel, one thread per query. Use 1 for single-threaded (streaming/sequential) search. More threads will result in higher throughput but also more concurrent IOs; find the balance depending on the SSD bandwidth. For latency-sensitive single-query workloads, use 1.
 
-(x, xi, ...) various search_list sizes to perform search with. Larger will result in slower latencies, but higher accuracies. Must be atleast the recall@ value in (vi).
+(vii) beamwidth: maximum number of IO requests each query will issue per iteration of search code. Larger beamwidth will result in fewer IO round-trips per query, but might result in slightly higher number of IO requests to SSD per query. Specifying 0 will optimize the beamwidth depending on the number of threads performing search. For single-threaded search, a value of 2-4 is typically good.
+
+(viii) query_file.bin: search on these queries, same format as data file (ii) above. The query file must be the same type as specified in (i).
+
+(ix) truthset.bin file. Must be in the following format, or specify "null": n, the number of queries (4 bytes) followed by d, the number of ground truth elements per query (4 bytes), followed by n*d entries per query representing the d closest IDs per query in integer format,  followed by n*d entries representing the corresponding distances (float). Total file size is 8 + 4*n*d + 4*n*d. The groundtruth file, if not available, can be calculated using our program, tests/utils/compute_groundtruth. If you just want to measure the latency numbers of search and output the nearest neighbors without calculating recall, enter "null".
+
+(x) K: measure recall@k, meaning the accuracy of retrieving top-k nearest neighbors.
+
+(xi) result output prefix: search results will be stored in files with specified prefix, in bin format.
+
+(xii) similarity metric: distance function to use. Supported values: "l2" (Euclidean) or "cosine". Use "l2" for most datasets including Turing-ANNS and SPACEV.
+
+(xiii, xiv, ...) various search_list sizes to perform search with. Larger will result in slower latencies, but higher accuracies. Must be at least the recall@ value in (x).
+
+
+**Output metrics reference for `search_disk_index`**
+=====================================================
+
+For each L (search list size) value, `search_disk_index` prints a block of the form:
+
+```
+=== L=<L>, Beamwidth=<B> ===
+- Time cost (us):           <total wall-clock time for all queries>
+- QPS:                      <queries per second>
+- Recall@K:                 <recall against ground truth (only with truthset)>
+- Avg latency (us):         <mean per-query latency>
+- P50 latency (us):         <median per-query latency>
+- P99 latency (us):         <99th-percentile per-query latency>
+- Avg io_us:                <mean time spent in disk I/O per query>
+- P50 io_us:                <median disk I/O time>
+- P99 io_us:                <99th-percentile disk I/O time>
+- Avg cpu_us:               <mean CPU time per query>
+- P50 cpu_us:               <median CPU time>
+- P99 cpu_us:               <99th-percentile CPU time>
+- Avg n_cmps:               <mean PQ distance comparisons per query>
+- Avg n_hops:               <mean beam-search iterations per query>
+- P50 n_hops:               <median beam-search iterations>
+- P99 n_hops:               <99th-percentile beam-search iterations>
+- Cache hits:               <total in-RAM cache hits across all queries>
+- Cache hit rate:           <hits / (hits + disk reads) × 100>%
+- Total sectors:            <total 4 KB sectors read from disk (= n_4k)>
+```
+
+**Experiment script**
+
+`scripts/run_disk_experiments.sh` runs every configured dataset across all cache
+sizes in one go.  Edit the arrays at the top of the script to match your paths:
+
+```bash
+bash scripts/run_disk_experiments.sh          # search only
+bash scripts/run_disk_experiments.sh --build  # build index then search
+```
+
+The script loops: `for each dataset × for each cache_size in {10000, 50000, 100000, 500000, 100000000}`.
+Each dataset has its own `index_type`, `similarity`, `K`, `beamwidth`, and `L` values.
+Add more datasets by extending the `DATASETS` array and the corresponding
+per-dataset config maps at the top of the script.
+
+
+**Recommended parameters for large-scale datasets**
+====================================================
+
+The following are recommended starting-point parameters for common benchmark datasets. Adjust B and M based on your available RAM.
+
+**arXiv float32** (10,000 points, dimension 768, float32, L2):
+- Build: `R=64 L=100 B=1 M=8 T=8 similarity=l2 single_file_index=0`
+- Search (single-threaded): `num_nodes_to_cache=5000 num_threads=1 beamwidth=4 K=10 similarity=l2`
+  ```
+  ./tests/build_disk_index float arxiv_data.bin arxiv_index 64 100 1 8 8 l2 0
+  ./tests/search_disk_index float arxiv_index 0 0 5000 1 4 arxiv_queries.bin null 10 arxiv_results l2 50 75 100
+  ```
+
+**Microsoft Turing-ANNS 100M** (100M points, dimension 100, float32, L2):
+- Build: `R=64 L=100 B=100 M=200 T=64 similarity=l2 single_file_index=0`
+  (B=100 sets a 100 GB RAM budget for the in-memory portion of the search index; M=200 limits RAM used during build to 200 GB. Reduce if your machine has less RAM.)
+- Search (single-threaded): `num_nodes_to_cache=500000 num_threads=1 beamwidth=4 K=10 similarity=l2`
+  ```
+  ./tests/build_disk_index float turing_data.bin turing_index 64 100 100 200 64 l2 0
+  ./tests/search_disk_index float turing_index 0 0 500000 1 4 turing_queries.bin turing_gt.bin 10 turing_results l2 100 150 200
+  ```
+
+**Microsoft SPACEV 100M** (100M points, dimension 100, int8, L2):
+- Build: `R=64 L=100 B=20 M=64 T=64 similarity=l2 single_file_index=0`
+  (B=20 sets a 20 GB RAM budget; M=64 limits RAM used during build to 64 GB. Adjust based on your machine.)
+- Search (single-threaded): `num_nodes_to_cache=500000 num_threads=1 beamwidth=4 K=10 similarity=l2`
+  ```
+  ./tests/build_disk_index int8 spacev_data.bin spacev_index 64 100 20 64 64 l2 0
+  ./tests/search_disk_index int8 spacev_index 0 0 500000 1 4 spacev_queries.bin spacev_gt.bin 10 spacev_results l2 100 150 200
+  ```
+
+See `scripts/` for ready-to-use shell scripts for each of these datasets.
+
 
 
 **Usage for in-memory indices**

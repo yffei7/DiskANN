@@ -1239,9 +1239,6 @@ namespace diskann {
             visited.insert(id);
             cmps++;
             float dist = dist_scratch[m];
-            if (stats != nullptr) {
-              stats->n_cmps++;
-            }
             if (dist >= retset[cur_list_size - 1].distance &&
                 (cur_list_size == l_search))
               continue;

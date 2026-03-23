@@ -361,6 +361,7 @@ sizes in one go.  Edit the arrays at the top of the script to match your paths:
 ```bash
 bash scripts/run_disk_experiments.sh          # search only
 bash scripts/run_disk_experiments.sh --build  # build index then search
+bash scripts/run_disk_experiments.sh --build 2>&1 | tee ./run_disk_experiments.log
 ```
 
 The script loops: `for each dataset × for each cache_size in {10000, 50000, 100000, 500000, 100000000}`.

@@ -1,0 +1,140 @@
+{
+  "arxiv": {
+    "type": "float",
+    "similarity": "l2",
+    "data_file": "/home/yfei/data/ANNS/arxiv/arxiv-base.bin",
+    "query_file": "/home/yfei/data/ANNS/arxiv/arxiv-query.bin",
+    "gt_file": "/home/yfei/data/ANNS/arxiv/arxiv_groundtruth_K10.diskann.bin",
+    "index_prefix": "/anns/indices/arxiv_index",
+    "result_dir": "/tmp/results/arxiv",
+    "k": 10,
+    "beamwidth": [2, 4],
+    "threads": 1,
+    "l_values": "100",
+    "cache_budgets_mb": [8, 16, 32, 64, 128],
+    "build": {
+      "R": 64,
+      "L": 75,
+      "B": 0.005,
+      "M": 4,
+      "T": 64
+    },
+    "tags": 0,
+    "single_file_index": 0
+  },
+  "spacev": {
+    "type": "int8",
+    "similarity": "l2",
+    "data_file": "/home/yfei/data/ANNS/SPACEV/vectors_100m.bin",
+    "query_file": "/home/yfei/data/ANNS/SPACEV/query.bin",
+    "gt_file": "/home/yfei/data/ANNS/SPACEV/spacev100m-sliced-30K_groundtruth_K10.diskann.bin",
+    "index_prefix": "/anns/indices/spacev_index",
+    "result_dir": "/tmp/results/spacev",
+    "k": 10,
+    "beamwidth": [2, 4],
+    "threads": 1,
+    "l_values": "100",
+    "cache_budgets_mb": [256, 512, 1024, 2048, 4096],
+    "build": {
+      "R": 64,
+      "L": 75,
+      "B": 1,
+      "M": 12,
+      "T": 64
+    },
+    "tags": 0,
+    "single_file_index": 0
+  },
+  "ms_turing": {
+    "type": "float",
+    "similarity": "l2",
+    "data_file": "/home/yfei/data/ANNS/ms_turing/base_100m.fbin",
+    "query_file": "/home/yfei/data/ANNS/ms_turing/query100K.fbin",
+    "gt_file": "/home/yfei/data/ANNS/ms_turing/msturing-gt-100M_k10.bin",
+    "index_prefix": "/anns/indices/msturing_index",
+    "result_dir": "/tmp/results/ms_turing",
+    "k": 10,
+    "beamwidth": [2, 4],
+    "threads": 1,
+    "l_values": "100",
+    "cache_budgets_mb": [512, 1024, 2048, 4096, 8192],
+    "build": {
+      "R": 64,
+      "L": 75,
+      "B": 1,
+      "M": 12,
+      "T": 64
+    },
+    "tags": 0,
+    "single_file_index": 0
+  },
+  "sift": {
+    "type": "uint8",
+    "similarity": "l2",
+    "data_file": "/home/yfei/data/ANNS/sift/sift_base.bin",
+    "query_file": "/home/yfei/data/ANNS/sift/sift_query.bin",
+    "gt_file": "/home/yfei/data/ANNS/sift/sift_groundtruth_K10.diskann.bin",
+    "index_prefix": "/anns/indices/sift_index",
+    "result_dir": "/tmp/results/sift",
+    "k": 10,
+    "beamwidth": [2, 4],
+    "threads": 1,
+    "l_values": "100",
+    "cache_budgets_mb": [16, 32, 64, 128, 256],
+    "build": {
+      "R": 64,
+      "L": 75,
+      "B": 0.008,
+      "M": 3,
+      "T": 64
+    },
+    "tags": 0,
+    "single_file_index": 0
+  },
+  "gist": {
+    "type": "float",
+    "similarity": "l2",
+    "data_file": "/home/yfei/data/ANNS/gist/gist_base.bin",
+    "query_file": "/home/yfei/data/ANNS/gist/gist_query.bin",
+    "gt_file": "/home/yfei/data/ANNS/gist/gist_groundtruth_K10.diskann.bin",
+    "index_prefix": "/anns/indices/gist_index",
+    "result_dir": "/tmp/results/gist",
+    "k": 10,
+    "beamwidth": [2, 4],
+    "threads": 1,
+    "l_values": "100",
+    "cache_budgets_mb": [64, 128, 256, 512, 1024],
+    "build": {
+      "R": 64,
+      "L": 75,
+      "B": 0.05,
+      "M": 4,
+      "T": 64
+    },
+    "tags": 0,
+    "single_file_index": 0
+  },
+  "sift-100M": {
+    "type": "uint8",
+    "similarity": "l2",
+    "data_file": "/home/yfei/data/ANNS/sift-100M/sift100m_base.bin",
+    "query_file": "/home/yfei/data/ANNS/sift-100M/sift100m_query.bin",
+    "gt_file": "/home/yfei/data/ANNS/sift-100M/sift100m_groundtruth_K10_exact.diskann.bin",
+    "index_prefix": "/anns/indices/sift100m_index",
+    "result_dir": "/tmp/results/sift-100M",
+    "k": 10,
+    "beamwidth": [2, 4],
+    "threads": 1,
+    "l_values": "100",
+    "cache_budgets_mb": [256, 512, 1024, 2048, 4096],
+    "build": {
+      "R": 64,
+      "L": 75,
+      "B": 1,
+      "M": 12,
+      "T": 64
+    },
+    "tags": 0,
+    "single_file_index": 0
+  }
+}

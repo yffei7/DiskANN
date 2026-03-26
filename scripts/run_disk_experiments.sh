@@ -35,7 +35,7 @@ if [[ -z "${DATASETS:-}" ]]; then
     # DATASETS=("spacev" "ms_turing" "sift" "sift-100M" "gist")
     # DATASETS=($(echo "$DATASETS_CONFIG" | jq -r 'keys[]'))
     # DATASETS=("arxiv" "spacev" "ms_turing" "sift" "sift-100M")
-    DATASETS=("sift-100M")
+    DATASETS=("gist")
 else
     IFS=' ' read -ra DATASETS <<< "$DATASETS"
 fi

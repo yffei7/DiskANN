@@ -359,3 +359,6 @@ cscope*
 
 # CMake build directory
 build/
+build_debug/
+build_fair_release/
+*.md

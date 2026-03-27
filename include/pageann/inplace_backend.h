@@ -11,6 +11,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <limits>
 #include <set>
 #include <string>
 #include <thread>
@@ -177,13 +178,12 @@ struct PendingTargetState {
     std::vector<uint32_t> sources;
     uint8_t scan_age_bit = 0;
     bool selected = false;
-    uint32_t last_append_epoch = 0;
 };
 
 class DeferredEdgeBuffer {
  public:
     DeferredEdgeBuffer();
-    size_t push(uint32_t target, uint32_t src, uint32_t append_epoch = 0);
+    size_t push(uint32_t target, uint32_t src);
     size_t size() const;
     size_t target_count() const;
     size_t aged_target_count() const;
@@ -380,13 +380,23 @@ class InPlaceGraphStore {
                                 std::vector<uint8_t>& found,
                                 std::vector<uint8_t>* flags_out = nullptr,
                                 bool resident_only = false);
+    template<typename T>
+    void     batch_compute_dists(const std::vector<uint32_t>& ids,
+                                 const T* query,
+                                 diskann::Distance<T>* dist,
+                                 std::vector<float>& out_dists,
+                                 std::vector<uint8_t>& found,
+                                 std::vector<uint8_t>* flags_out = nullptr,
+                                 bool resident_only = false);
     void     batch_fetch_frontier_neighbors(const std::vector<unsigned>& ids,
                                             std::vector<std::vector<unsigned>>& neighbors,
                                             std::vector<uint8_t>& found);
 
     // Allocation
     void     allocate_node(uint32_t node_id);
+    void     allocate_nodes_batch(const uint32_t* node_ids, size_t count);
     void     publish_node(uint32_t node_id);
+    void     publish_nodes_batch(const uint32_t* node_ids, size_t count);
     void     mark_deleted(uint32_t node_id);
     bool     is_active(uint32_t node_id) const;
     uint32_t get_page_id(uint32_t node_id) const;
@@ -525,6 +535,70 @@ class InPlaceGraphStore {
     void     clear_bitmap(char* page_data, uint16_t slot_idx);
     bool     test_bitmap(const char* page_data, uint16_t slot_idx) const;
 };
+
+template<typename T>
+void InPlaceGraphStore::batch_compute_dists(const std::vector<uint32_t>& ids,
+                                            const T* query,
+                                            diskann::Distance<T>* dist,
+                                            std::vector<float>& out_dists,
+                                            std::vector<uint8_t>& found,
+                                            std::vector<uint8_t>* flags_out,
+                                            bool resident_only) {
+    found.assign(ids.size(), 0);
+    out_dists.assign(ids.size(), std::numeric_limits<float>::max());
+    if (flags_out) flags_out->assign(ids.size(), 0);
+    if (ids.empty() || query == nullptr || dist == nullptr) return;
+
+    struct BatchItem {
+        uint32_t page_id;
+        uint16_t slot_idx;
+        uint32_t node_id;
+        size_t out_idx;
+    };
+
+    std::vector<BatchItem> items;
+    items.reserve(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        uint32_t node_id = ids[i];
+        if (node_id >= _node_to_rid.size()) continue;
+        RID rid = _node_to_rid[node_id];
+        if (rid.page_id == INVALID_PAGE) continue;
+        items.push_back(BatchItem{rid.page_id, rid.slot_idx, node_id, i});
+    }
+    std::sort(items.begin(), items.end(), [](const BatchItem& a, const BatchItem& b) {
+        if (a.page_id != b.page_id) return a.page_id < b.page_id;
+        return a.slot_idx < b.slot_idx;
+    });
+
+    size_t cursor = 0;
+    while (cursor < items.size()) {
+        uint32_t page_id = items[cursor].page_id;
+        PageFrame* frame_ptr = resident_only ? _bp.try_pin_resident(page_id, FrameRegion::QUERY)
+                                             : &_bp.pin(page_id, FrameRegion::QUERY);
+        if (frame_ptr == nullptr) {
+            while (cursor < items.size() && items[cursor].page_id == page_id) ++cursor;
+            continue;
+        }
+        while (cursor < items.size() && items[cursor].page_id == page_id) {
+            const auto& item = items[cursor];
+            char* slot_ptr = frame_ptr->data + header_bytes() + item.slot_idx * _slot_size;
+            PackedSlotHeader hdr;
+            memcpy(&hdr, slot_ptr, sizeof(hdr));
+            if (hdr.node_id == item.node_id && !(hdr.flags & FLAG_DELETED)) {
+                const T* coords_ptr = reinterpret_cast<const T*>(slot_ptr + sizeof(PackedSlotHeader));
+                out_dists[item.out_idx] = dist->compare(query, coords_ptr, _aligned_dim);
+                found[item.out_idx] = 1;
+                if (flags_out) (*flags_out)[item.out_idx] = hdr.flags;
+                _stats.logical_bytes_read.fetch_add(
+                    sizeof(PackedSlotHeader) + static_cast<uint64_t>(_aligned_dim) * _elem_size +
+                    static_cast<uint64_t>(hdr.degree) * sizeof(uint32_t),
+                    std::memory_order_relaxed);
+            }
+            ++cursor;
+        }
+        _bp.unpin(page_id, false);
+    }
+}
 
 }  // namespace inplace
 }  // namespace diskann

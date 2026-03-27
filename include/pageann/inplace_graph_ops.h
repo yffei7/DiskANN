@@ -7,7 +7,7 @@
 #include <vector>
 #include "distance.h"
 #include "neighbor.h"
-#include "v2/inplace_backend.h"
+#include "pageann/inplace_backend.h"
 #include "tsl/robin_set.h"
 
 namespace diskann {
@@ -21,7 +21,9 @@ std::pair<uint32_t, uint32_t>
 graph_iterate_to_fixed_point(
     const T* query, unsigned L,
     const std::vector<unsigned>& init_ids,
+    const T* init_coord_cache,
     unsigned beamwidth,
+    bool static_query_fast_path,
     InPlaceGraphStore* store,
     unsigned aligned_dim,
     Distance<T>* dist_cmp,

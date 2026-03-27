@@ -17,7 +17,7 @@ else()
 	set(CMAKE_CXX_COMPILER g++)
 endif()
 
-project(diskann)
+project(PageANN)
 include_directories(${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/include/tsl/include ${PROJECT_SOURCE_DIR}/include/dll ${PROJECT_SOURCE_DIR}/include/ols)
 
 #OpenMP
@@ -100,4 +100,3 @@ endif()
 
 add_subdirectory(src)
 add_subdirectory(tests)
-add_subdirectory(tests/utils)

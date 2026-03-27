@@ -1,0 +1,329 @@
+{
+  "arxiv": {
+    "type": "float",
+    "similarity": "l2",
+    "data_file": "/home/yfei/data/ANNS/arxiv/arxiv-base.bin",
+    "query_file": "/home/yfei/data/ANNS/arxiv/arxiv-query.bin",
+    "gt_file": "/home/yfei/data/ANNS/arxiv/arxiv_groundtruth_K10_flat.diskann.bin",
+    "index_prefix": "/anns/indices/arxiv_index",
+    "result_dir": "/tmp/results/arxiv",
+    "k": 10,
+    "beamwidth": [4],
+    "threads": 1,
+    "l_values": [200],
+    "cache_budgets_mb": [8, 16, 32, 64, 128],
+    "build": {
+      "R": 64,
+      "L": 100,
+      "B": 0.01,
+      "M": 15,
+      "T": 16
+    },
+    "base_points_default": null,
+    "query_count_default": 1000,
+    "update_rounds_default": 20,
+    "updates_per_round_default": 500,
+    "search_L_default": 100,
+    "beamwidth_default": 8,
+    "nodes_to_cache_default": 12000,
+    "query_threads_default": 2,
+    "insert_threads_default": 1,
+    "delete_threads_default": 1,
+    "build_threads_default": 8,
+    "inplace_buffer_pool_frames_query_default": 16384,
+    "inplace_buffer_pool_frames_update_default": 24576,
+    "inplace_buffer_pool_frames_mix_default": 32768,
+    "inplace_buffer_pool_frames_default": 32768,
+    "odin_mem_L_default": 64,
+    "system_defaults": {
+      "inplace": {
+        "insert_search_L": 100,
+        "build_C": 256
+      },
+      "greator": {
+        "L_mem": 100,
+        "R_mem": 64,
+        "alpha_mem": 1.2,
+        "L_disk": 100,
+        "R_disk": 64,
+        "alpha_disk": 1.2
+      },
+      "odinann": {
+        "mem_L": 128,
+        "search_L_override": 120,
+        "beamwidth_override": 64,
+        "pq_bytes_override": 32
+      }
+    },
+    "tags": 1,
+    "single_file_index": 0
+  },
+  "spacev": {
+    "type": "int8",
+    "similarity": "l2",
+    "data_file": "/home/yfei/data/ANNS/SPACEV/vectors_100m.bin",
+    "query_file": "/home/yfei/data/ANNS/SPACEV/query.bin",
+    "gt_file": "/home/yfei/data/ANNS/SPACEV/spacev100m-sliced-30K_groundtruth_K10_flat.diskann.bin",
+    "index_prefix": "/anns/indices/spacev_index",
+    "result_dir": "/tmp/results/spacev",
+    "k": 10,
+    "beamwidth": [4],
+    "threads": 1,
+    "l_values": [200],
+    "cache_budgets_mb": [256, 512, 1024, 2048, 4096],
+    "build": {
+      "R": 64,
+      "L": 90,
+      "B": 1,
+      "M": 15,
+      "T": 32
+    },
+    "base_points_default": null,
+    "query_count_default": 10000,
+    "update_rounds_default": 20,
+    "updates_per_round_default": 100000,
+    "search_L_default": 90,
+    "beamwidth_default": 8,
+    "nodes_to_cache_default": 3000000,
+    "query_threads_default": 8,
+    "insert_threads_default": 4,
+    "delete_threads_default": 4,
+    "build_threads_default": 32,
+    "inplace_buffer_pool_frames_query_default": 131072,
+    "inplace_buffer_pool_frames_update_default": 196608,
+    "inplace_buffer_pool_frames_mix_default": 262144,
+    "inplace_buffer_pool_frames_default": 262144,
+    "odin_mem_L_default": 128,
+    "system_defaults": {
+      "inplace": {
+        "insert_search_L": 90,
+        "build_C": 256
+      },
+      "greator": {
+        "L_mem": 90,
+        "R_mem": 64,
+        "alpha_mem": 1.2,
+        "L_disk": 90,
+        "R_disk": 64,
+        "alpha_disk": 1.2
+      },
+      "odinann": {
+        "mem_L": 128,
+        "search_L_override": 100,
+        "beamwidth_override": 32,
+        "pq_bytes_override": 32
+      }
+    },
+    "tags": 1,
+    "single_file_index": 0
+  },
+  "ms_turing": {
+    "type": "float",
+    "similarity": "l2",
+    "data_file": "/home/yfei/data/ANNS/ms_turing/base_100m.fbin",
+    "query_file": "/home/yfei/data/ANNS/ms_turing/query100K.fbin",
+    "gt_file": "/home/yfei/data/ANNS/ms_turing/msturing-gt-100M_k10.bin",
+    "index_prefix": "/anns/indices/msturing_index",
+    "result_dir": "/tmp/results/ms_turing",
+    "k": 10,
+    "beamwidth": [4],
+    "threads": 1,
+    "l_values": [200],
+    "cache_budgets_mb": [512, 1024, 2048, 4096, 8192],
+    "build": {
+      "R": 64,
+      "L": 100,
+      "B": 1,
+      "M": 15,
+      "T": 32
+    },
+    "base_points_default": null,
+    "query_count_default": 10000,
+    "update_rounds_default": 20,
+    "updates_per_round_default": 100000,
+    "search_L_default": 100,
+    "beamwidth_default": 8,
+    "nodes_to_cache_default": 3500000,
+    "query_threads_default": 8,
+    "insert_threads_default": 4,
+    "delete_threads_default": 4,
+    "build_threads_default": 32,
+    "inplace_buffer_pool_frames_query_default": 262144,
+    "inplace_buffer_pool_frames_update_default": 327680,
+    "inplace_buffer_pool_frames_mix_default": 393216,
+    "inplace_buffer_pool_frames_default": 393216,
+    "odin_mem_L_default": 128,
+    "system_defaults": {
+      "inplace": {
+        "insert_search_L": 100,
+        "build_C": 256
+      },
+      "greator": {
+        "L_mem": 100,
+        "R_mem": 64,
+        "alpha_mem": 1.2,
+        "L_disk": 100,
+        "R_disk": 64,
+        "alpha_disk": 1.2
+      },
+      "odinann": {
+        "mem_L": 128,
+        "search_L_override": 110,
+        "beamwidth_override": 32,
+        "pq_bytes_override": 32
+      }
+    },
+    "tags": 1,
+    "single_file_index": 0
+  },
+  "sift": {
+    "type": "float",
+    "similarity": "l2",
+    "data_file": "/home/yfei/data/ANNS/sift/sift_base.bin",
+    "query_file": "/home/yfei/data/ANNS/sift/sift_query.bin",
+    "gt_file": "/home/yfei/data/ANNS/sift/sift_groundtruth_K10_flat.diskann.bin",
+    "index_prefix": "/anns/indices/sift_index",
+    "result_dir": "/tmp/results/sift",
+    "k": 10,
+    "beamwidth": [4],
+    "threads": 1,
+    "l_values": [200],
+    "cache_budgets_mb":  [16, 32, 64, 128, 256],
+    "build": {
+      "R": 64,
+      "L": 75,
+      "B": 0.008,
+      "M": 15,
+      "T": 32
+    },
+    "base_points_default": null,
+    "query_count_default": 5000,
+    "update_rounds_default": 20,
+    "updates_per_round_default": 2000,
+    "search_L_default": 75,
+    "beamwidth_default": 8,
+    "nodes_to_cache_default": 95000,
+    "query_threads_default": 4,
+    "insert_threads_default": 2,
+    "delete_threads_default": 2,
+    "build_threads_default": 16,
+    "inplace_buffer_pool_frames_query_default": 16384,
+    "inplace_buffer_pool_frames_update_default": 24576,
+    "inplace_buffer_pool_frames_mix_default": 32768,
+    "inplace_buffer_pool_frames_default": 32768,
+    "odin_mem_L_default": 64,
+    "system_defaults": {
+      "inplace": {
+        "insert_search_L": 75,
+        "build_C": 256
+      },
+      "greator": {
+        "L_mem": 75,
+        "R_mem": 64,
+        "alpha_mem": 1.2,
+        "L_disk": 75,
+        "R_disk": 64,
+        "alpha_disk": 1.2
+      },
+      "odinann": {
+        "mem_L": 64,
+        "search_L_override": 90,
+        "beamwidth_override": 32,
+        "pq_bytes_override": 32
+      }
+    },
+    "tags": 1,
+    "single_file_index": 0
+  },
+  "gist": {
+    "type": "float",
+    "similarity": "l2",
+    "data_file": "/home/yfei/data/ANNS/gist/gist_base.bin",
+    "query_file": "/home/yfei/data/ANNS/gist/gist_query.bin",
+    "gt_file": "/home/yfei/data/ANNS/gist/gist_groundtruth_K10.diskann.bin",
+    "index_prefix": "/anns/indices/gist_index",
+    "result_dir": "/tmp/results/gist",
+    "k": 10,
+    "beamwidth": [4],
+    "threads": 1,
+    "l_values": [200],
+    "cache_budgets_mb": [64, 128, 256, 512, 1024],
+    "build": {
+      "R": 64,
+      "L": 75,
+      "B": 0.05,
+      "M": 15,
+      "T": 64
+    },
+    "base_points_default": null,
+    "query_count_default": 1000,
+    "update_rounds_default": 20,
+    "updates_per_round_default": 1000,
+    "search_L_default": 50,
+    "beamwidth_default": 4,
+    "nodes_to_cache_default": 95000,
+    "inplace_buffer_pool_frames_default": 8192,
+    "odin_mem_L_default": 32,
+    "tags": 1,
+    "single_file_index": 0
+  },
+  "sift-100M": {
+    "type": "uint8",
+    "similarity": "l2",
+    "data_file": "/home/yfei/data/ANNS/sift-100M/learn.100M.u8bin",
+    "query_file": "/home/yfei/data/ANNS/sift-100M/query.public.10K.u8bin",
+    "gt_file": "/home/yfei/data/ANNS/sift-100M/sift100m_groundtruth_K10_exact.diskann.bin",
+    "index_prefix": "/anns/indices/sift100m_index",
+    "result_dir": "/tmp/results/sift-100M",
+    "k": 10,
+    "beamwidth": [4],
+    "threads": 1,
+    "l_values": [200],
+    "cache_budgets_mb": [256, 512, 1024, 2048, 4096],
+    "build": {
+      "R": 64,
+      "L": 90,
+      "B": 1,
+      "M": 15,
+      "T": 32
+    },
+    "base_points_default": null,
+    "query_count_default": 10000,
+    "update_rounds_default": 20,
+    "updates_per_round_default": 100000,
+    "search_L_default": 90,
+    "beamwidth_default": 8,
+    "nodes_to_cache_default": 3000000,
+    "query_threads_default": 8,
+    "insert_threads_default": 4,
+    "delete_threads_default": 4,
+    "build_threads_default": 32,
+    "inplace_buffer_pool_frames_query_default": 196608,
+    "inplace_buffer_pool_frames_update_default": 262144,
+    "inplace_buffer_pool_frames_mix_default": 327680,
+    "inplace_buffer_pool_frames_default": 327680,
+    "odin_mem_L_default": 128,
+    "system_defaults": {
+      "inplace": {
+        "insert_search_L": 90,
+        "build_C": 256
+      },
+      "greator": {
+        "L_mem": 90,
+        "R_mem": 64,
+        "alpha_mem": 1.2,
+        "L_disk": 90,
+        "R_disk": 64,
+        "alpha_disk": 1.2
+      },
+      "odinann": {
+        "mem_L": 128,
+        "search_L_override": 100,
+        "beamwidth_override": 32,
+        "pq_bytes_override": 32
+      }
+    },
+    "tags": 1,
+    "single_file_index": 0
+  }
+}

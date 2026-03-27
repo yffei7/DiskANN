@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "v2/inplace_graph_ops.h"
-#include "v2/inplace_backend.h"
+#include "pageann/inplace_graph_ops.h"
+#include "pageann/inplace_backend.h"
 #include "logger.h"
 
 #include <algorithm>
@@ -78,7 +78,9 @@ std::pair<uint32_t, uint32_t>
 graph_iterate_to_fixed_point(
     const T* query, unsigned L,
     const std::vector<unsigned>& init_ids,
+    const T* init_coord_cache,
     unsigned beamwidth,
+    bool static_query_fast_path,
     InPlaceGraphStore* store,
     unsigned aligned_dim,
     Distance<T>* dist_cmp,
@@ -109,24 +111,28 @@ graph_iterate_to_fixed_point(
     }
 
     unsigned l = 0;
-    for (auto id : init_ids) {
+    for (size_t init_idx = 0; init_idx < init_ids.size(); ++init_idx) {
+        auto id = init_ids[init_idx];
         if (inserted_into_pool.find(id) != inserted_into_pool.end()) continue;
-        if (!store->is_active(id)) continue;
-
-        // Full-precision distance for seed nodes
-        auto view = store->pin_node(id, READ);
-        if (view._page_id == INVALID_PAGE) continue;
-
-        // Copy to aligned scratch for SIMD safety
-        char* aligned = scratch->aligned_coord_scratch +
-                        (scratch->coord_idx % InPlaceSearchScratch::MAX_SCRATCH_NODES) *
-                        aligned_dim * sizeof(T);
-        memcpy(aligned, view.coords, (size_t)aligned_dim * sizeof(T));
-        scratch->coord_idx++;
-        store->unpin_node(view);
+        if (!static_query_fast_path && !store->is_active(id)) continue;
 
         auto start = std::chrono::steady_clock::now();
-        float dist = dist_cmp->compare(query, (const T*)aligned, aligned_dim);
+        float dist = 0.0f;
+        if (init_coord_cache != nullptr) {
+            dist = dist_cmp->compare(query,
+                                     init_coord_cache + init_idx * static_cast<size_t>(aligned_dim),
+                                     aligned_dim);
+        } else {
+            auto view = store->pin_node(id, READ);
+            if (view._page_id == INVALID_PAGE) continue;
+            char* aligned = scratch->aligned_coord_scratch +
+                            (scratch->coord_idx % InPlaceSearchScratch::MAX_SCRATCH_NODES) *
+                            aligned_dim * sizeof(T);
+            memcpy(aligned, view.coords, (size_t)aligned_dim * sizeof(T));
+            scratch->coord_idx++;
+            store->unpin_node(view);
+            dist = dist_cmp->compare(query, reinterpret_cast<const T*>(aligned), aligned_dim);
+        }
         scratch->record_distance(scope, elapsed_ns(start), 1);
         inserted_into_pool.insert(id);
         best_L_nodes[l++] = Neighbor(id, dist, true);
@@ -180,14 +186,18 @@ graph_iterate_to_fixed_point(
                     nbr_ids.push_back(nbr);
                 }
             }
-            store->append_pending_reverse_neighbors(n, nbr_ids);
+            if (!static_query_fast_path) {
+                store->append_pending_reverse_neighbors(n, nbr_ids);
+            }
 
             if (nbr_ids.size() > 1) {
+                tsl::robin_set<unsigned> deduped_seen;
+                deduped_seen.reserve(nbr_ids.size() * 2);
                 std::vector<unsigned> deduped;
                 deduped.reserve(nbr_ids.size());
                 for (unsigned nbr : nbr_ids) {
                     if (nbr == n || inserted_into_pool.find(nbr) != inserted_into_pool.end()) continue;
-                    if (std::find(deduped.begin(), deduped.end(), nbr) == deduped.end()) {
+                    if (deduped_seen.insert(nbr).second) {
                         deduped.push_back(nbr);
                     }
                 }
@@ -228,13 +238,14 @@ graph_iterate_to_fixed_point(
                 char* batch_coords = scratch->aligned_coord_scratch +
                     (scratch->coord_idx % InPlaceSearchScratch::MAX_SCRATCH_NODES) *
                     aligned_dim * sizeof(T);
-                store->batch_fetch_coords(nbr_ids, batch_coords, found, &flags, false);
+                store->batch_fetch_coords(nbr_ids, batch_coords, found,
+                                         static_query_fast_path ? nullptr : &flags, false);
                 uint64_t local_cmps = 0;
                 auto start = std::chrono::steady_clock::now();
                 for (size_t m = 0; m < nbr_ids.size(); ++m) {
                     unsigned id = nbr_ids[m];
                     inserted_into_pool.insert(id);
-                    if (!found[m] || (flags[m] & FLAG_DELETED)) continue;
+                    if (!found[m] || (!static_query_fast_path && (flags[m] & FLAG_DELETED))) continue;
                     const char* aligned = batch_coords + m * aligned_dim * sizeof(T);
                     scratch->coord_idx++;
                     cmps++;
@@ -267,22 +278,36 @@ graph_iterate_to_fixed_point(
             std::vector<uint8_t> resident_found(confirm_ids.size(), 0);
             uint64_t local_cmps = 0;
             auto confirm_start = std::chrono::steady_clock::now();
-            for (size_t idx = 0; idx < confirm_ids.size(); ++idx) {
-                auto nview = store->try_pin_node_if_resident(confirm_ids[idx], READ);
-                if (nview._page_id == INVALID_PAGE || (nview.flags & FLAG_DELETED)) {
-                    if (nview._page_id != INVALID_PAGE) store->unpin_node(nview);
-                    continue;
+            if (static_query_fast_path) {
+                std::vector<float> resident_dists;
+                std::vector<uint8_t> resident_batch_found;
+                store->batch_compute_dists<T>(confirm_ids, query, dist_cmp,
+                                              resident_dists, resident_batch_found,
+                                              nullptr, true);
+                for (size_t idx = 0; idx < confirm_ids.size(); ++idx) {
+                    if (!resident_batch_found[idx]) continue;
+                    best_L_nodes[confirm_slots[idx]].distance = resident_dists[idx];
+                    resident_found[idx] = 1;
+                    local_cmps++;
                 }
-                char* aligned = scratch->aligned_coord_scratch +
-                    (scratch->coord_idx % InPlaceSearchScratch::MAX_SCRATCH_NODES) *
-                    aligned_dim * sizeof(T);
-                memcpy(aligned, nview.coords, (size_t)aligned_dim * sizeof(T));
-                scratch->coord_idx++;
-                store->unpin_node(nview);
-                best_L_nodes[confirm_slots[idx]].distance =
-                    dist_cmp->compare(query, reinterpret_cast<const T*>(aligned), aligned_dim);
-                resident_found[idx] = 1;
-                local_cmps++;
+            } else {
+                for (size_t idx = 0; idx < confirm_ids.size(); ++idx) {
+                    auto nview = store->try_pin_node_if_resident(confirm_ids[idx], READ);
+                    if (nview._page_id == INVALID_PAGE || (nview.flags & FLAG_DELETED)) {
+                        if (nview._page_id != INVALID_PAGE) store->unpin_node(nview);
+                        continue;
+                    }
+                    char* aligned = scratch->aligned_coord_scratch +
+                        (scratch->coord_idx % InPlaceSearchScratch::MAX_SCRATCH_NODES) *
+                        aligned_dim * sizeof(T);
+                    memcpy(aligned, nview.coords, (size_t)aligned_dim * sizeof(T));
+                    scratch->coord_idx++;
+                    store->unpin_node(nview);
+                    best_L_nodes[confirm_slots[idx]].distance =
+                        dist_cmp->compare(query, reinterpret_cast<const T*>(aligned), aligned_dim);
+                    resident_found[idx] = 1;
+                    local_cmps++;
+                }
             }
 
             std::vector<uint32_t> miss_ids;
@@ -301,9 +326,10 @@ graph_iterate_to_fixed_point(
                 char* batch_coords = scratch->aligned_coord_scratch +
                     (scratch->coord_idx % InPlaceSearchScratch::MAX_SCRATCH_NODES) *
                     aligned_dim * sizeof(T);
-                store->batch_fetch_coords(miss_ids, batch_coords, found, &flags, false);
+                store->batch_fetch_coords(miss_ids, batch_coords, found,
+                                         static_query_fast_path ? nullptr : &flags, false);
                 for (size_t idx = 0; idx < miss_ids.size(); ++idx) {
-                    if (!found[idx] || (flags[idx] & FLAG_DELETED)) continue;
+                    if (!found[idx] || (!static_query_fast_path && (flags[idx] & FLAG_DELETED))) continue;
                     const char* aligned = batch_coords + idx * aligned_dim * sizeof(T);
                     scratch->coord_idx++;
                     best_L_nodes[miss_slots[idx]].distance =
@@ -323,7 +349,7 @@ graph_iterate_to_fixed_point(
     std::vector<Neighbor> clean;
     clean.reserve(l);
     for (unsigned i = 0; i < l; i++) {
-        if (store->is_active(best_L_nodes[i].id)) {
+        if (static_query_fast_path || store->is_active(best_L_nodes[i].id)) {
             clean.push_back(best_L_nodes[i]);
         }
     }
@@ -334,21 +360,35 @@ graph_iterate_to_fixed_point(
         std::vector<uint8_t> resident_found(rerank_ids.size(), 0);
         uint64_t local_cmps = 0;
         auto rerank_start = std::chrono::steady_clock::now();
-        for (size_t idx = 0; idx < rerank_ids.size(); ++idx) {
-            auto nview = store->try_pin_node_if_resident(rerank_ids[idx], READ);
-            if (nview._page_id == INVALID_PAGE || (nview.flags & FLAG_DELETED)) {
-                if (nview._page_id != INVALID_PAGE) store->unpin_node(nview);
-                continue;
+        if (static_query_fast_path) {
+            std::vector<float> resident_dists;
+            std::vector<uint8_t> resident_batch_found;
+            store->batch_compute_dists<T>(rerank_ids, query, dist_cmp,
+                                          resident_dists, resident_batch_found,
+                                          nullptr, true);
+            for (size_t idx = 0; idx < rerank_ids.size(); ++idx) {
+                if (!resident_batch_found[idx]) continue;
+                clean[idx].distance = resident_dists[idx];
+                resident_found[idx] = 1;
+                local_cmps++;
             }
-            char* aligned = scratch->aligned_coord_scratch +
-                (scratch->coord_idx % InPlaceSearchScratch::MAX_SCRATCH_NODES) *
-                aligned_dim * sizeof(T);
-            memcpy(aligned, nview.coords, (size_t)aligned_dim * sizeof(T));
-            scratch->coord_idx++;
-            store->unpin_node(nview);
-            clean[idx].distance = dist_cmp->compare(query, reinterpret_cast<const T*>(aligned), aligned_dim);
-            resident_found[idx] = 1;
-            local_cmps++;
+        } else {
+            for (size_t idx = 0; idx < rerank_ids.size(); ++idx) {
+                auto nview = store->try_pin_node_if_resident(rerank_ids[idx], READ);
+                if (nview._page_id == INVALID_PAGE || (nview.flags & FLAG_DELETED)) {
+                    if (nview._page_id != INVALID_PAGE) store->unpin_node(nview);
+                    continue;
+                }
+                char* aligned = scratch->aligned_coord_scratch +
+                    (scratch->coord_idx % InPlaceSearchScratch::MAX_SCRATCH_NODES) *
+                    aligned_dim * sizeof(T);
+                memcpy(aligned, nview.coords, (size_t)aligned_dim * sizeof(T));
+                scratch->coord_idx++;
+                store->unpin_node(nview);
+                clean[idx].distance = dist_cmp->compare(query, reinterpret_cast<const T*>(aligned), aligned_dim);
+                resident_found[idx] = 1;
+                local_cmps++;
+            }
         }
         std::vector<uint32_t> miss_ids;
         std::vector<uint32_t> miss_slots;
@@ -364,9 +404,10 @@ graph_iterate_to_fixed_point(
             char* batch_coords = scratch->aligned_coord_scratch +
                 (scratch->coord_idx % InPlaceSearchScratch::MAX_SCRATCH_NODES) *
                 aligned_dim * sizeof(T);
-            store->batch_fetch_coords(miss_ids, batch_coords, found, &flags, false);
+            store->batch_fetch_coords(miss_ids, batch_coords, found,
+                                     static_query_fast_path ? nullptr : &flags, false);
             for (size_t idx = 0; idx < miss_ids.size(); ++idx) {
-                if (!found[idx] || (flags[idx] & FLAG_DELETED)) continue;
+                if (!found[idx] || (!static_query_fast_path && (flags[idx] & FLAG_DELETED))) continue;
                 const char* aligned = batch_coords + idx * aligned_dim * sizeof(T);
                 scratch->coord_idx++;
                 clean[miss_slots[idx]].distance =
@@ -1132,7 +1173,7 @@ template uint32_t InPlaceGraphStore::sweep_repair_round<int8_t>(
 // ===========================================================================
 template std::pair<uint32_t, uint32_t>
 graph_iterate_to_fixed_point<float>(
-    const float*, unsigned, const std::vector<unsigned>&, unsigned,
+    const float*, unsigned, const std::vector<unsigned>&, const float*, unsigned, bool,
     InPlaceGraphStore*, unsigned, Distance<float>*,
     InPlaceSearchScratch*, std::vector<Neighbor>&,
     tsl::robin_set<unsigned>*, DistanceScope, unsigned,
@@ -1140,7 +1181,7 @@ graph_iterate_to_fixed_point<float>(
 
 template std::pair<uint32_t, uint32_t>
 graph_iterate_to_fixed_point<uint8_t>(
-    const uint8_t*, unsigned, const std::vector<unsigned>&, unsigned,
+    const uint8_t*, unsigned, const std::vector<unsigned>&, const uint8_t*, unsigned, bool,
     InPlaceGraphStore*, unsigned, Distance<uint8_t>*,
     InPlaceSearchScratch*, std::vector<Neighbor>&,
     tsl::robin_set<unsigned>*, DistanceScope, unsigned,
@@ -1148,7 +1189,7 @@ graph_iterate_to_fixed_point<uint8_t>(
 
 template std::pair<uint32_t, uint32_t>
 graph_iterate_to_fixed_point<int8_t>(
-    const int8_t*, unsigned, const std::vector<unsigned>&, unsigned,
+    const int8_t*, unsigned, const std::vector<unsigned>&, const int8_t*, unsigned, bool,
     InPlaceGraphStore*, unsigned, Distance<int8_t>*,
     InPlaceSearchScratch*, std::vector<Neighbor>&,
     tsl::robin_set<unsigned>*, DistanceScope, unsigned,

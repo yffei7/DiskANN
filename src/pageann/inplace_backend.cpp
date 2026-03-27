@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
 
-#include "v2/inplace_backend.h"
+#include "pageann/inplace_backend.h"
 #include "index.h"
 #include "logger.h"
 
@@ -157,7 +157,7 @@ size_t DeferredEdgeBuffer::shard_index(uint32_t target) const {
     return static_cast<size_t>(target) % kShardCount;
 }
 
-size_t DeferredEdgeBuffer::push(uint32_t target, uint32_t src, uint32_t append_epoch) {
+size_t DeferredEdgeBuffer::push(uint32_t target, uint32_t src) {
     auto& shard = *_shards[shard_index(target)];
     std::lock_guard<std::mutex> lk(shard.mtx);
     auto it = shard.target_to_state.find(target);
@@ -171,7 +171,6 @@ size_t DeferredEdgeBuffer::push(uint32_t target, uint32_t src, uint32_t append_e
             _target_count.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    state.last_append_epoch = append_epoch;
     return sources.size();
 }
 
@@ -1036,46 +1035,93 @@ static void grow_active_flags(std::atomic<uint8_t>*& arr, uint32_t& cap,
 
 void InPlaceGraphStore::allocate_node(uint32_t node_id) {
     std::lock_guard<std::mutex> lk(_alloc_mtx);
-
-    if (node_id >= _node_to_rid.size()) {
-        size_t new_sz = (size_t)node_id + 1;
-        _node_to_rid.resize(new_sz, RID{INVALID_PAGE, 0});
-    }
-    if (node_id >= _node_active_cap) {
-        grow_active_flags(_node_active_flags, _node_active_cap,
-                          (uint32_t)(node_id + 1));
-    }
-    if (node_id >= _max_nodes) {
-        uint32_t new_max = std::max((uint32_t)(node_id + 1),
-                                    _max_nodes * 2 + 1);
-        if (_n_chunks > 0) {
-            uint8_t* new_codes = nullptr;
-            alloc_aligned((void**)&new_codes,
-                          (size_t)new_max * _n_chunks, 32);
-            memset(new_codes, 0, (size_t)new_max * _n_chunks);
-            if (_pq_codes && _max_nodes > 0) {
-                memcpy(new_codes, _pq_codes, (size_t)_max_nodes * _n_chunks);
-                aligned_free(_pq_codes);
-            }
-            _pq_codes = new_codes;
+    auto allocate_one_locked = [&](uint32_t current_node_id) {
+        if (current_node_id >= _node_to_rid.size()) {
+            size_t new_sz = (size_t)current_node_id + 1;
+            _node_to_rid.resize(new_sz, RID{INVALID_PAGE, 0});
         }
-        _max_nodes = new_max;
+        if (current_node_id >= _node_active_cap) {
+            grow_active_flags(_node_active_flags, _node_active_cap,
+                              (uint32_t)(current_node_id + 1));
+        }
+        if (current_node_id >= _max_nodes) {
+            uint32_t new_max = std::max((uint32_t)(current_node_id + 1),
+                                        _max_nodes * 2 + 1);
+            if (_n_chunks > 0) {
+                uint8_t* new_codes = nullptr;
+                alloc_aligned((void**)&new_codes,
+                              (size_t)new_max * _n_chunks, 32);
+                memset(new_codes, 0, (size_t)new_max * _n_chunks);
+                if (_pq_codes && _max_nodes > 0) {
+                    memcpy(new_codes, _pq_codes, (size_t)_max_nodes * _n_chunks);
+                    aligned_free(_pq_codes);
+                }
+                _pq_codes = new_codes;
+            }
+            _max_nodes = new_max;
+        }
+
+        RID rid = allocate_slot();
+        _node_to_rid[current_node_id] = rid;
+
+        auto& frame = _bp.pin(rid.page_id, FrameRegion::UPDATE);
+        char* slot_ptr = frame.data + header_bytes() + rid.slot_idx * _slot_size;
+        PackedSlotHeader hdr;
+        hdr.degree  = 0;
+        hdr.flags   = 0;
+        hdr._pad    = 0;
+        hdr.node_id = current_node_id;
+        memcpy(slot_ptr, &hdr, sizeof(hdr));
+        _bp.unpin(rid.page_id, true);
+    };
+    allocate_one_locked(node_id);
+}
+
+void InPlaceGraphStore::allocate_nodes_batch(const uint32_t* node_ids, size_t count) {
+    if (node_ids == nullptr || count == 0) return;
+    std::lock_guard<std::mutex> lk(_alloc_mtx);
+    auto allocate_one_locked = [&](uint32_t current_node_id) {
+        if (current_node_id >= _node_to_rid.size()) {
+            size_t new_sz = (size_t)current_node_id + 1;
+            _node_to_rid.resize(new_sz, RID{INVALID_PAGE, 0});
+        }
+        if (current_node_id >= _node_active_cap) {
+            grow_active_flags(_node_active_flags, _node_active_cap,
+                              (uint32_t)(current_node_id + 1));
+        }
+        if (current_node_id >= _max_nodes) {
+            uint32_t new_max = std::max((uint32_t)(current_node_id + 1),
+                                        _max_nodes * 2 + 1);
+            if (_n_chunks > 0) {
+                uint8_t* new_codes = nullptr;
+                alloc_aligned((void**)&new_codes,
+                              (size_t)new_max * _n_chunks, 32);
+                memset(new_codes, 0, (size_t)new_max * _n_chunks);
+                if (_pq_codes && _max_nodes > 0) {
+                    memcpy(new_codes, _pq_codes, (size_t)_max_nodes * _n_chunks);
+                    aligned_free(_pq_codes);
+                }
+                _pq_codes = new_codes;
+            }
+            _max_nodes = new_max;
+        }
+
+        RID rid = allocate_slot();
+        _node_to_rid[current_node_id] = rid;
+
+        auto& frame = _bp.pin(rid.page_id, FrameRegion::UPDATE);
+        char* slot_ptr = frame.data + header_bytes() + rid.slot_idx * _slot_size;
+        PackedSlotHeader hdr;
+        hdr.degree  = 0;
+        hdr.flags   = 0;
+        hdr._pad    = 0;
+        hdr.node_id = current_node_id;
+        memcpy(slot_ptr, &hdr, sizeof(hdr));
+        _bp.unpin(rid.page_id, true);
+    };
+    for (size_t i = 0; i < count; ++i) {
+        allocate_one_locked(node_ids[i]);
     }
-
-    RID rid = allocate_slot();
-    _node_to_rid[node_id] = rid;
-    // Node stays INACTIVE -- callers must call publish_node() after
-    // coords, neighbors, and PQ codes are fully written.
-
-    auto& frame = _bp.pin(rid.page_id, FrameRegion::UPDATE);
-    char* slot_ptr = frame.data + header_bytes() + rid.slot_idx * _slot_size;
-    PackedSlotHeader hdr;
-    hdr.degree  = 0;
-    hdr.flags   = 0;
-    hdr._pad    = 0;
-    hdr.node_id = node_id;
-    memcpy(slot_ptr, &hdr, sizeof(hdr));
-    _bp.unpin(rid.page_id, true);
 }
 
 void InPlaceGraphStore::publish_node(uint32_t node_id) {
@@ -1090,6 +1136,28 @@ void InPlaceGraphStore::publish_node(uint32_t node_id) {
     } else if (!_entry_candidates.empty()) {
         _entry_candidates[_entry_rr_cursor % _entry_candidates.size()] = node_id;
         _entry_rr_cursor++;
+    }
+}
+
+void InPlaceGraphStore::publish_nodes_batch(const uint32_t* node_ids, size_t count) {
+    if (node_ids == nullptr || count == 0) return;
+    for (size_t i = 0; i < count; ++i) {
+        uint32_t node_id = node_ids[i];
+        if (node_id < _node_active_cap) {
+            uint8_t prev = _node_active_flags[node_id].exchange(
+                1, std::memory_order_release);
+            if (prev == 0) _num_active.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    std::lock_guard<std::mutex> lk(_entry_mtx);
+    for (size_t i = 0; i < count; ++i) {
+        uint32_t node_id = node_ids[i];
+        if (_entry_candidates.size() < 4096) {
+            _entry_candidates.push_back(node_id);
+        } else if (!_entry_candidates.empty()) {
+            _entry_candidates[_entry_rr_cursor % _entry_candidates.size()] = node_id;
+            _entry_rr_cursor++;
+        }
     }
 }
 
@@ -1448,7 +1516,7 @@ void InPlaceGraphStore::encode_pq(uint32_t node_id, const float* coords) {
 }
 
 void InPlaceGraphStore::defer_reverse_edge(uint32_t target, uint32_t src) {
-    _deferred_edges.push(target, src, maintenance_epoch());
+    _deferred_edges.push(target, src);
     _stats.deferred_edges_pushed.fetch_add(1);
 }
 

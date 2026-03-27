@@ -1,8 +1,8 @@
 #pragma once
 
-#include "v2/graph_delta.h"
-#include "v2/fs_allocator.h"
-#include "v2/index_merger.h"
+#include "pageann/graph_delta.h"
+#include "pageann/fs_allocator.h"
+#include "pageann/index_merger.h"
 #include "tsl/robin_map.h"
 #include "tsl/robin_set.h"
 #include "pq_flash_index.h"

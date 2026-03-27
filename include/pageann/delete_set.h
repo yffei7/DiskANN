@@ -1,6 +1,6 @@
 #pragma once
 
-#include "v2/graph_delta.h"
+#include "pageann/graph_delta.h"
 #include "tsl/robin_map.h"
 #include "tsl/robin_set.h"
 #include <algorithm>

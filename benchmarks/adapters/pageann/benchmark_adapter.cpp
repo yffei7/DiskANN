@@ -24,8 +24,8 @@
 #include "partition_and_pq.h"
 #include "timer.h"
 #include "utils.h"
-#include "v2/inplace_backend.h"
-#include "v2/inplace_graph_ops.h"
+#include "pageann/inplace_backend.h"
+#include "pageann/inplace_graph_ops.h"
 
 using namespace diskann::inplace;
 
@@ -1227,7 +1227,7 @@ int main(int argc, char **argv) {
     std::cerr << "Unsupported type: " << type << std::endl;
     return -1;
   } catch (const std::exception &e) {
-    std::cerr << "fair_benchmark failed: " << e.what() << std::endl;
+    std::cerr << "pageann_benchmark failed: " << e.what() << std::endl;
     return -1;
   }
 }

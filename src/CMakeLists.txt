@@ -7,11 +7,13 @@ if(MSVC)
 	add_subdirectory(dll)
 else()
 	#file(GLOB CPP_SOURCES *.cpp)
+	# Keep the inherited merge-path sources until a deeper dependency audit proves
+	# they are safe to remove from the current PageANN library build.
 	set(CPP_SOURCES ann_exception.cpp aux_utils.cpp index.cpp
         linux_aligned_file_reader.cpp math_utils.cpp memory_mapper.cpp
         partition_and_pq.cpp pq_flash_index.cpp logger.cpp distance.cpp
-		 utils.cpp v2/graph_delta.cpp v2/index_merger.cpp
-        v2/merge_insert.cpp v2/inplace_backend.cpp v2/inplace_graph_ops.cpp)
+		 utils.cpp pageann/graph_delta.cpp pageann/index_merger.cpp
+        pageann/merge_insert.cpp pageann/inplace_backend.cpp pageann/inplace_graph_ops.cpp)
 	add_library(${PROJECT_NAME} ${CPP_SOURCES})
 	add_library(${PROJECT_NAME}_s STATIC ${CPP_SOURCES})
 endif()

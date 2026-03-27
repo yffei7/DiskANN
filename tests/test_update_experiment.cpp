@@ -5,8 +5,8 @@
 // Supports --smoke for quick correctness checks and mixed workloads
 // for metric collection. Outputs JSONL records.
 
-#include "v2/inplace_backend.h"
-#include "v2/inplace_graph_ops.h"
+#include "pageann/inplace_backend.h"
+#include "pageann/inplace_graph_ops.h"
 #include "index.h"
 #include "utils.h"
 #include "timer.h"
@@ -298,7 +298,7 @@ static bool smoke_1_disk_query(const std::string& data_root) {
 
     std::vector<diskann::Neighbor> results;
     graph_iterate_to_fixed_point<float>(
-        qvec, search_L, {(unsigned) store.entry_point()}, &store, aligned_dim,
+        qvec, search_L, {(unsigned) store.entry_point()}, 4, &store, aligned_dim,
         &dist_cmp, &scratch, results);
 
     // Brute force top-K for recall
@@ -379,7 +379,7 @@ static bool smoke_2_update_deferred(const std::string& data_root) {
     scratch.init(aligned_dim, 0, sizeof(float));
     std::vector<diskann::Neighbor> candidates;
     graph_iterate_to_fixed_point<float>(
-        coords, L, {(unsigned) store.entry_point()}, &store, aligned_dim,
+        coords, L, {(unsigned) store.entry_point()}, 4, &store, aligned_dim,
         &dist_cmp, &scratch, candidates, nullptr, DistanceScope::UPDATE);
 
     std::vector<unsigned> pruned;
@@ -447,7 +447,7 @@ static bool smoke_2_update_deferred(const std::string& data_root) {
 
     std::vector<diskann::Neighbor> results;
     graph_iterate_to_fixed_point<float>(
-        qvec, search_L, {(unsigned) store.entry_point()}, &store, aligned_dim,
+        qvec, search_L, {(unsigned) store.entry_point()}, 4, &store, aligned_dim,
         &dist_cmp, &scratch, results);
 
     for (uint32_t i = 0; i < K && i < results.size(); i++) {
@@ -570,7 +570,7 @@ static bool smoke_4_mixed_concurrent(const std::string& data_root) {
       const float*                   qvec = base_data + qi * base_aligned_dim;
       std::vector<diskann::Neighbor> results;
       graph_iterate_to_fixed_point<float>(
-          qvec, 20, {(unsigned) store.entry_point()}, &store, aligned_dim,
+          qvec, 20, {(unsigned) store.entry_point()}, 4, &store, aligned_dim,
           &dist_cmp, &scratch, results);
       query_count.fetch_add(1);
     }
@@ -588,7 +588,7 @@ static bool smoke_4_mixed_concurrent(const std::string& data_root) {
 
       std::vector<diskann::Neighbor> candidates;
       graph_iterate_to_fixed_point<float>(
-          coords, 30, {(unsigned) store.entry_point()}, &store, aligned_dim,
+          coords, 30, {(unsigned) store.entry_point()}, 4, &store, aligned_dim,
           &dist_cmp, &scratch, candidates, nullptr, DistanceScope::UPDATE);
 
       std::vector<unsigned> pruned;
@@ -662,7 +662,7 @@ static bool smoke_5_alignment_safety() {
     query[d] = (float) (rng() % 1000) / 100.0f;
 
   std::vector<diskann::Neighbor> results;
-  graph_iterate_to_fixed_point<float>(query, 20, {0u}, &store, aligned_dim,
+  graph_iterate_to_fixed_point<float>(query, 20, {0u}, 4, &store, aligned_dim,
                                       &dist_cmp, &scratch, results);
 
   std::cout << "  No SIMD fault (completed search on " << n_nodes << " nodes)"
@@ -845,7 +845,7 @@ static void run_mixed_workload(
       diskann::Timer                 timer;
       std::vector<diskann::Neighbor> results;
       graph_iterate_to_fixed_point<T>(
-          qvec, search_Ls[0], {(unsigned) store.entry_point()}, &store,
+          qvec, search_Ls[0], {(unsigned) store.entry_point()}, 4, &store,
           aligned_dim, dist_cmp, &scratch, results);
       double lat = (double) timer.elapsed();
       if (max_queries > 0) {
@@ -881,7 +881,7 @@ static void run_mixed_workload(
 
         std::vector<diskann::Neighbor> candidates;
         graph_iterate_to_fixed_point<T>(
-            coords, L, {(unsigned) store.entry_point()}, &store, aligned_dim,
+            coords, L, {(unsigned) store.entry_point()}, 4, &store, aligned_dim,
             dist_cmp, &scratch, candidates, nullptr, DistanceScope::UPDATE);
 
         std::vector<unsigned> pruned;

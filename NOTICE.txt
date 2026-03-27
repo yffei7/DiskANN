@@ -1,4 +1,16 @@
-This algorithms builds upon [code for NSG](https://github.com/ZJULearning/nsg), commit: 335e8e, licensed under the following terms.
+PageANN is derived from DiskANN and retains inherited components that the current
+runtime and benchmark path still depend on. DiskANN itself builds upon NSG.
+
+This repository keeps the original upstream MIT licensing model and preserves
+the NSG attribution below.
+
+NSG attribution
+---------------
+
+This algorithm builds upon code for NSG:
+https://github.com/ZJULearning/nsg
+
+Referenced commit: 335e8e
 
 MIT License
 

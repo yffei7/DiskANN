@@ -75,6 +75,7 @@ void graph_prune_neighbors_pq(
 void graph_inter_insert_deferred(
     unsigned new_node,
     std::vector<unsigned>& pruned_list,
+    unsigned prune_R,
     InPlaceGraphStore* store);
 
 }  // namespace inplace

@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -397,7 +398,7 @@ static bool smoke_2_update_deferred(const std::string& data_root) {
     store.unpin_node(view);
     store.encode_pq(node_id, coords);
     store.publish_node(node_id);
-    graph_inter_insert_deferred(node_id, pruned, &store);
+    graph_inter_insert_deferred(node_id, pruned, R, &store);
     store.stats().total_inserts.fetch_add(1);
   }
 
@@ -414,7 +415,8 @@ static bool smoke_2_update_deferred(const std::string& data_root) {
   }
 
   // Drain deferred edges
-  store.drain_deferred_edges<float>(R, R * 2, alpha, aligned_dim, &dist_cmp);
+  store.drain_deferred_edges<float>(R, R * 2, alpha, 0, aligned_dim,
+                                    std::numeric_limits<uint32_t>::max(), &dist_cmp);
 
   // Search and check
   std::string query_path = data_root + "/sift/sift_query.bin";
@@ -601,7 +603,7 @@ static bool smoke_4_mixed_concurrent(const std::string& data_root) {
       store.commit_node(view);
       store.unpin_node(view);
       store.publish_node(next_id);
-      graph_inter_insert_deferred(next_id, pruned, &store);
+      graph_inter_insert_deferred(next_id, pruned, R, &store);
 
       update_count.fetch_add(1);
       next_id++;
@@ -899,7 +901,7 @@ static void run_mixed_workload(
               node_id, (const float*) (base_data + node_id * base_aligned_dim));
         }
         store.publish_node(node_id);
-        graph_inter_insert_deferred(node_id, pruned, &store);
+        graph_inter_insert_deferred(node_id, pruned, R, &store);
 
         {
           std::unique_lock<std::shared_timed_mutex> lk(active_mtx);
@@ -1092,7 +1094,8 @@ static void run_mixed_workload(
     t.join();
 
   // Final drain + flush
-  store.drain_deferred_edges<T>(R, R * 2, alpha, aligned_dim, dist_cmp);
+  store.drain_deferred_edges<T>(R, R * 2, alpha, 0, aligned_dim,
+                                std::numeric_limits<uint32_t>::max(), dist_cmp);
   store.flush();
   store.stop_bg_flush();
 

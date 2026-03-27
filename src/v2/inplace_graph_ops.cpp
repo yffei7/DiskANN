@@ -141,6 +141,8 @@ graph_iterate_to_fixed_point(
     frontier_ids.reserve(std::max<unsigned>(1, beamwidth));
     std::vector<unsigned> nbr_ids;
     nbr_ids.reserve(store->max_degree());
+    std::vector<std::vector<unsigned>> frontier_neighbors;
+    std::vector<uint8_t> frontier_found;
 
     while (k < l) {
         unsigned nk = l;
@@ -159,26 +161,38 @@ graph_iterate_to_fixed_point(
             continue;
         }
 
-        for (auto n : frontier_ids) {
+        store->batch_fetch_frontier_neighbors(frontier_ids, frontier_neighbors,
+                                              frontier_found);
+
+        for (size_t frontier_idx = 0; frontier_idx < frontier_ids.size(); ++frontier_idx) {
+            unsigned n = frontier_ids[frontier_idx];
             hops++;
             if (visited_ids) visited_ids->insert(n);
-
-            auto view = store->pin_node(n, READ);
-            if (view._page_id == INVALID_PAGE) continue;
-            if (view.flags & FLAG_DELETED) {
-                store->unpin_node(view);
+            if (frontier_idx >= frontier_neighbors.size() || !frontier_found[frontier_idx]) {
                 continue;
             }
 
             nbr_ids.clear();
-            nbr_ids.reserve(std::max<size_t>(nbr_ids.capacity(), view.degree));
-            for (uint16_t m = 0; m < view.degree; m++) {
-                unsigned nbr = view.neighbors[m];
+            const auto& on_page = frontier_neighbors[frontier_idx];
+            nbr_ids.reserve(std::max<size_t>(nbr_ids.capacity(), on_page.size()));
+            for (unsigned nbr : on_page) {
                 if (inserted_into_pool.find(nbr) == inserted_into_pool.end()) {
                     nbr_ids.push_back(nbr);
                 }
             }
-            store->unpin_node(view);
+            store->append_pending_reverse_neighbors(n, nbr_ids);
+
+            if (nbr_ids.size() > 1) {
+                std::vector<unsigned> deduped;
+                deduped.reserve(nbr_ids.size());
+                for (unsigned nbr : nbr_ids) {
+                    if (nbr == n || inserted_into_pool.find(nbr) != inserted_into_pool.end()) continue;
+                    if (std::find(deduped.begin(), deduped.end(), nbr) == deduped.end()) {
+                        deduped.push_back(nbr);
+                    }
+                }
+                nbr_ids.swap(deduped);
+            }
 
             if (nbr_ids.empty()) continue;
 
@@ -543,68 +557,38 @@ void graph_prune_neighbors_pq(
 void graph_inter_insert_deferred(
     unsigned new_node,
     std::vector<unsigned>& pruned_list,
+    unsigned prune_R,
     InPlaceGraphStore* store) {
+    (void) prune_R;
     if (!store->is_active(new_node)) return;
     for (auto des : pruned_list) {
         if (des == new_node) continue;
         if (!store->is_active(des)) continue;
-        auto view = store->try_pin_node_if_resident(des, WRITE);
-        bool deferred = true;
-        if (view._page_id != INVALID_PAGE) {
-            if (view.flags & FLAG_DELETED) {
-                deferred = false;
-            } else {
-                bool exists = false;
-                for (uint16_t j = 0; j < view.degree; ++j) {
-                    if (view.neighbors[j] == new_node) {
-                        exists = true;
-                        break;
-                    }
-                }
-                if (exists) {
-                    deferred = false;
-                } else if (view.degree < view._Mmax) {
-                    view.neighbors[view.degree++] = new_node;
-                    store->commit_node(view);
-                    deferred = false;
-                }
-            }
-            store->unpin_node(view);
-        }
-        if (deferred) {
-            store->defer_reverse_edge(des, new_node);
-        }
+        store->defer_reverse_edge(des, new_node);
     }
 }
 
 // ===========================================================================
 // drain_deferred_edges -- template method on InPlaceGraphStore
-// Page-local batching: sort by page, group by page, pin page once,
-// process all targets within that page before unpinning.
+// Overlay is the source of truth for deferred reverse edges. Once pressure
+// crosses a threshold, select targets needing attention, group them by page,
+// and repair each page in a single pin/unpin cycle.
 // ===========================================================================
 template<typename T>
 void InPlaceGraphStore::drain_deferred_edges(
     unsigned R, unsigned C, float alpha,
-    unsigned aligned_dim, diskann::Distance<T>* dist) {
-
-    auto edges = _deferred_edges.drain();
-    if (edges.empty()) return;
-
-    // Build per-target source lists
-    tsl::robin_map<uint32_t, std::vector<uint32_t>> target_to_sources;
-    target_to_sources.reserve(edges.size());
-    for (auto& e : edges) {
-        if (!is_active(e.target)) continue;
-        if (!is_active(e.src)) continue;
-        target_to_sources[e.target].push_back(e.src);
+    unsigned pending_threshold, unsigned aligned_dim, uint32_t max_targets,
+    diskann::Distance<T>* dist) {
+    bool force_all = max_targets == std::numeric_limits<uint32_t>::max();
+    auto targets = _deferred_edges.select_targets_for_repair(
+        pending_threshold,
+        force_all ? 0 : max_targets,
+        force_all);
+    if (targets.empty()) {
+        _stats.repair_queue_length.store(_deferred_edges.aged_target_count(), std::memory_order_relaxed);
+        return;
     }
-
-    // Collect targets and sort by page_id for locality
-    std::vector<uint32_t> targets;
-    targets.reserve(target_to_sources.size());
-    for (auto& kv : target_to_sources) {
-        targets.push_back(kv.first);
-    }
+    _stats.repair_queue_length.store(targets.size(), std::memory_order_relaxed);
     std::sort(targets.begin(), targets.end(),
               [this](uint32_t a, uint32_t b) {
                   return get_page_id(a) < get_page_id(b);
@@ -616,6 +600,8 @@ void InPlaceGraphStore::drain_deferred_edges(
     current_nbrs.reserve(_Mmax + R);
     tsl::robin_set<unsigned> existing;
     existing.reserve(_Mmax + R);
+    tsl::robin_set<unsigned> final_set;
+    final_set.reserve(_Mmax + R);
     std::vector<Neighbor> pool;
     pool.reserve(_Mmax + R);
     std::vector<unsigned> pruned;
@@ -632,7 +618,12 @@ void InPlaceGraphStore::drain_deferred_edges(
         while (ti < targets.size() && get_page_id(targets[ti]) == cur_page) {
             ti++;
         }
-        if (cur_page == INVALID_PAGE) continue;
+        if (cur_page == INVALID_PAGE) {
+            for (size_t idx = page_start; idx < ti; ++idx) {
+                _deferred_edges.finish_target(targets[idx], {}, true);
+            }
+            continue;
+        }
 
         // Pin the page once for the entire batch
         auto& frame = _bp.pin(cur_page, FrameRegion::UPDATE);
@@ -640,19 +631,31 @@ void InPlaceGraphStore::drain_deferred_edges(
 
         for (size_t idx = page_start; idx < ti; idx++) {
             uint32_t target = targets[idx];
-            auto& sources = target_to_sources[target];
+            std::vector<uint32_t> sources;
+            _deferred_edges.snapshot(target, sources);
+            if (sources.empty()) {
+                _deferred_edges.finish_target(target, {}, false);
+                continue;
+            }
 
-            if (!is_active(target)) continue;
+            if (!is_active(target)) {
+                _deferred_edges.finish_target(target, sources, false);
+                _stats.deferred_edges_drained.fetch_add(sources.size(), std::memory_order_relaxed);
+                continue;
+            }
 
             // Locate the slot directly within the already-pinned page
             RID rid;
             {
                 std::lock_guard<std::mutex> lk(_alloc_mtx);
-                if (target >= _node_to_rid.size()) continue;
+                if (target >= _node_to_rid.size()) {
+                    _deferred_edges.finish_target(target, {}, true);
+                    continue;
+                }
                 rid = _node_to_rid[target];
             }
             if (rid.page_id != cur_page) {
-                // Shouldn't happen, but guard against it
+                _deferred_edges.finish_target(target, {}, true);
                 continue;
             }
 
@@ -660,9 +663,18 @@ void InPlaceGraphStore::drain_deferred_edges(
                              rid.slot_idx * _slot_size;
             PackedSlotHeader hdr;
             memcpy(&hdr, slot_ptr, sizeof(hdr));
+            if (hdr.flags & FLAG_DELETED) {
+                _deferred_edges.finish_target(target, sources, false);
+                _stats.deferred_edges_drained.fetch_add(sources.size(), std::memory_order_relaxed);
+                continue;
+            }
 
             uint32_t* nbrs_ptr = (uint32_t*)(slot_ptr +
                 sizeof(PackedSlotHeader) + _aligned_dim * _elem_size);
+            std::vector<uint32_t> remove_sources;
+            remove_sources.reserve(sources.size());
+            tsl::robin_set<uint32_t> remove_set;
+            remove_set.reserve(sources.size());
 
             current_nbrs.clear();
             current_nbrs.reserve(std::max<size_t>(current_nbrs.capacity(),
@@ -674,18 +686,32 @@ void InPlaceGraphStore::drain_deferred_edges(
             existing.clear();
             existing.insert(current_nbrs.begin(), current_nbrs.end());
             for (auto src : sources) {
-                if (!is_active(src)) continue;
-                if (existing.find(src) == existing.end() && src != target) {
+                if (src == target || !is_active(src)) {
+                    if (remove_set.insert(src).second) remove_sources.push_back(src);
+                    continue;
+                }
+                if (existing.find(src) != existing.end()) {
+                    if (remove_set.insert(src).second) remove_sources.push_back(src);
+                    continue;
+                }
+                if (existing.find(src) == existing.end()) {
                     current_nbrs.push_back(src);
                     existing.insert(src);
                 }
             }
 
             if (current_nbrs.size() <= (size_t)R) {
-                hdr.degree = (uint16_t)current_nbrs.size();
+                hdr.degree = (uint16_t)std::min((size_t)_Mmax, current_nbrs.size());
                 for (uint16_t j = 0; j < hdr.degree; j++) {
                     nbrs_ptr[j] = current_nbrs[j];
                 }
+                for (uint32_t src : sources) {
+                    if (remove_set.find(src) != remove_set.end()) continue;
+                    if (existing.find(src) != existing.end()) {
+                        if (remove_set.insert(src).second) remove_sources.push_back(src);
+                    }
+                }
+                clear_oversized_node(target);
             } else {
                 // Prune with distance ranking
                 pool.clear();
@@ -742,24 +768,175 @@ void InPlaceGraphStore::drain_deferred_edges(
                 for (uint16_t j = 0; j < hdr.degree; j++) {
                     nbrs_ptr[j] = pruned[j];
                 }
+                final_set.clear();
+                for (uint32_t nbr : pruned) final_set.insert(nbr);
+                for (uint32_t src : sources) {
+                    if (src == target || !is_active(src)) {
+                        if (remove_set.insert(src).second) remove_sources.push_back(src);
+                        continue;
+                    }
+                    if (existing.find(src) != existing.end() &&
+                        final_set.find(src) != final_set.end()) {
+                        if (remove_set.insert(src).second) remove_sources.push_back(src);
+                    } else if (final_set.find(src) != final_set.end() &&
+                               remove_set.find(src) == remove_set.end()) {
+                        if (remove_set.insert(src).second) remove_sources.push_back(src);
+                    }
+                }
+                clear_oversized_node(target);
             }
 
             memcpy(slot_ptr, &hdr, sizeof(hdr));
             page_modified = true;
-            _stats.deferred_edges_drained.fetch_add(sources.size());
+            size_t drained = remove_sources.size();
+            _deferred_edges.finish_target(target, remove_sources, true);
+            _stats.deferred_edges_drained.fetch_add(drained, std::memory_order_relaxed);
         }
 
         _bp.unpin(cur_page, page_modified);
     }
+    _stats.repair_queue_length.store(_deferred_edges.aged_target_count(), std::memory_order_relaxed);
 }
 
 // Explicit instantiations
 template void InPlaceGraphStore::drain_deferred_edges<float>(
-    unsigned, unsigned, float, unsigned, diskann::Distance<float>*);
+    unsigned, unsigned, float, unsigned, unsigned, uint32_t, diskann::Distance<float>*);
 template void InPlaceGraphStore::drain_deferred_edges<uint8_t>(
-    unsigned, unsigned, float, unsigned, diskann::Distance<uint8_t>*);
+    unsigned, unsigned, float, unsigned, unsigned, uint32_t, diskann::Distance<uint8_t>*);
 template void InPlaceGraphStore::drain_deferred_edges<int8_t>(
-    unsigned, unsigned, float, unsigned, diskann::Distance<int8_t>*);
+    unsigned, unsigned, float, unsigned, unsigned, uint32_t, diskann::Distance<int8_t>*);
+
+// ===========================================================================
+// prune_oversized_nodes -- age-aware pruning for nodes that temporarily keep
+// extra reverse edges in the slack region.
+// ===========================================================================
+template<typename T>
+uint32_t InPlaceGraphStore::prune_oversized_nodes(
+    uint32_t budget, unsigned R, unsigned C, float alpha,
+    unsigned aligned_dim, uint32_t age_threshold_rounds,
+    diskann::Distance<T>* dist) {
+    auto candidates = _oversized_nodes.collect_candidates(maintenance_epoch(), age_threshold_rounds, budget);
+    if (candidates.empty()) return 0;
+
+    std::sort(candidates.begin(), candidates.end(),
+              [this](uint32_t a, uint32_t b) {
+                  return get_page_id(a) < get_page_id(b);
+              });
+
+    InPlaceSearchScratch local_scratch;
+    local_scratch.init(aligned_dim, _n_chunks, sizeof(T));
+    std::vector<Neighbor> pool;
+    std::vector<unsigned> pruned;
+    std::vector<uint8_t> pq_scratch_buf;
+    std::vector<float> dist_buf;
+    uint32_t pruned_nodes = 0;
+
+    size_t idx = 0;
+    while (idx < candidates.size()) {
+        uint32_t cur_page = get_page_id(candidates[idx]);
+        size_t page_start = idx;
+        while (idx < candidates.size() && get_page_id(candidates[idx]) == cur_page) {
+            ++idx;
+        }
+        if (cur_page == INVALID_PAGE) continue;
+
+        auto& frame = _bp.pin(cur_page, FrameRegion::UPDATE);
+        bool page_modified = false;
+        for (size_t i = page_start; i < idx; ++i) {
+            uint32_t node_id = candidates[i];
+            RID rid;
+            {
+                std::lock_guard<std::mutex> lk(_alloc_mtx);
+                if (node_id >= _node_to_rid.size()) {
+                    clear_oversized_node(node_id);
+                    continue;
+                }
+                rid = _node_to_rid[node_id];
+            }
+            if (rid.page_id != cur_page) continue;
+
+            char* slot_ptr = frame.data + header_bytes() + rid.slot_idx * _slot_size;
+            PackedSlotHeader hdr;
+            memcpy(&hdr, slot_ptr, sizeof(hdr));
+            if ((hdr.flags & FLAG_DELETED) || hdr.degree <= R) {
+                clear_oversized_node(node_id);
+                continue;
+            }
+
+            uint32_t* nbrs_ptr = reinterpret_cast<uint32_t*>(
+                slot_ptr + sizeof(PackedSlotHeader) + _aligned_dim * _elem_size);
+            std::vector<unsigned> current_nbrs;
+            current_nbrs.reserve(hdr.degree);
+            for (uint16_t j = 0; j < hdr.degree; ++j) {
+                if (is_active(nbrs_ptr[j])) current_nbrs.push_back(nbrs_ptr[j]);
+            }
+            if (current_nbrs.size() <= (size_t)R) {
+                hdr.degree = (uint16_t)current_nbrs.size();
+                for (uint16_t j = 0; j < hdr.degree; ++j) nbrs_ptr[j] = current_nbrs[j];
+                memcpy(slot_ptr, &hdr, sizeof(hdr));
+                page_modified = true;
+                clear_oversized_node(node_id);
+                continue;
+            }
+
+            pool.clear();
+            if (_n_chunks > 0 && _pq_codes) {
+                pq_scratch_buf.resize(current_nbrs.size() * _n_chunks + 64);
+                dist_buf.resize(current_nbrs.size());
+                auto dist_start = std::chrono::steady_clock::now();
+                compute_pq_dists_src(node_id, current_nbrs.data(), dist_buf.data(),
+                                     (uint32_t)current_nbrs.size(), pq_scratch_buf.data());
+                _stats.record_distance(DistanceScope::UPDATE, elapsed_ns(dist_start),
+                                       (uint64_t)current_nbrs.size());
+                for (size_t j = 0; j < current_nbrs.size(); ++j) {
+                    pool.emplace_back(current_nbrs[j], dist_buf[j], true);
+                }
+            } else {
+                char* src_coords = slot_ptr + sizeof(PackedSlotHeader);
+                T* aligned_src = reinterpret_cast<T*>(local_scratch.aux_coord_scratch);
+                T* aligned_cand = reinterpret_cast<T*>(
+                    local_scratch.aux_coord_scratch + aligned_dim * sizeof(T));
+                memcpy(aligned_src, src_coords, aligned_dim * sizeof(T));
+                uint64_t local_cmps = 0;
+                auto dist_start = std::chrono::steady_clock::now();
+                for (unsigned cand : current_nbrs) {
+                    auto cv = pin_node(cand, READ);
+                    float d = std::numeric_limits<float>::max();
+                    if (cv._page_id != INVALID_PAGE) {
+                        memcpy(aligned_cand, cv.coords, aligned_dim * sizeof(T));
+                        d = dist->compare(aligned_src, aligned_cand, aligned_dim);
+                        local_cmps++;
+                        unpin_node(cv);
+                    }
+                    pool.emplace_back(cand, d, true);
+                }
+                _stats.record_distance(DistanceScope::UPDATE, elapsed_ns(dist_start), local_cmps);
+            }
+
+            pruned.clear();
+            graph_prune_neighbors_pq<T>(node_id, pool, R, C, alpha,
+                                        pruned, this, &local_scratch,
+                                        aligned_dim, dist, DistanceScope::UPDATE);
+            hdr.degree = (uint16_t)std::min((size_t)_Mmax, pruned.size());
+            for (uint16_t j = 0; j < hdr.degree; ++j) nbrs_ptr[j] = pruned[j];
+            memcpy(slot_ptr, &hdr, sizeof(hdr));
+            page_modified = true;
+            clear_oversized_node(node_id);
+            pruned_nodes++;
+        }
+        _bp.unpin(cur_page, page_modified);
+    }
+
+    _stats.nodes_repaired.fetch_add(pruned_nodes, std::memory_order_relaxed);
+    return pruned_nodes;
+}
+
+template uint32_t InPlaceGraphStore::prune_oversized_nodes<float>(
+    uint32_t, unsigned, unsigned, float, unsigned, uint32_t, diskann::Distance<float>*);
+template uint32_t InPlaceGraphStore::prune_oversized_nodes<uint8_t>(
+    uint32_t, unsigned, unsigned, float, unsigned, uint32_t, diskann::Distance<uint8_t>*);
+template uint32_t InPlaceGraphStore::prune_oversized_nodes<int8_t>(
+    uint32_t, unsigned, unsigned, float, unsigned, uint32_t, diskann::Distance<int8_t>*);
 
 // ===========================================================================
 // sweep_repair_round -- distance-based pruning + generation rollover
@@ -860,6 +1037,7 @@ uint32_t InPlaceGraphStore::sweep_repair_round(
                 hdr.degree = 0;
                 memcpy(slot_ptr, &hdr, sizeof(hdr));
                 page_modified = true;
+                clear_oversized_node(hdr.node_id);
                 repaired++;
                 continue;
             }
@@ -922,6 +1100,11 @@ uint32_t InPlaceGraphStore::sweep_repair_round(
             }
             memcpy(slot_ptr, &hdr, sizeof(hdr));
             page_modified = true;
+            if (hdr.degree > R) {
+                note_oversized_node(hdr.node_id, hdr.degree);
+            } else {
+                clear_oversized_node(hdr.node_id);
+            }
             repaired++;
         }
 

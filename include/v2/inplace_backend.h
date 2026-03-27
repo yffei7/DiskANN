@@ -173,15 +173,69 @@ struct DeferredEdge {
     uint32_t src;
 };
 
+struct PendingTargetState {
+    std::vector<uint32_t> sources;
+    uint8_t scan_age_bit = 0;
+    bool selected = false;
+    uint32_t last_append_epoch = 0;
+};
+
 class DeferredEdgeBuffer {
  public:
-    void   push(uint32_t target, uint32_t src);
+    DeferredEdgeBuffer();
+    size_t push(uint32_t target, uint32_t src, uint32_t append_epoch = 0);
     size_t size() const;
-    std::vector<DeferredEdge> drain();
+    size_t target_count() const;
+    size_t aged_target_count() const;
+    void snapshot(uint32_t target, std::vector<uint32_t>& out) const;
+    std::vector<uint32_t> select_targets_for_repair(uint32_t pending_threshold,
+                                                    size_t limit = 0,
+                                                    bool force_all = false);
+    size_t finish_target(uint32_t target,
+                         const std::vector<uint32_t>& remove_sources,
+                         bool set_scan_age_bit);
  private:
-    mutable std::mutex        _mtx;
-    std::vector<DeferredEdge> _buffer;
-    tsl::robin_set<uint64_t>  _seen;
+    struct Shard {
+        mutable std::mutex mtx;
+        tsl::robin_map<uint32_t, PendingTargetState> target_to_state;
+    };
+
+    size_t shard_index(uint32_t target) const;
+
+    static constexpr size_t kShardCount = 64;
+    std::vector<std::unique_ptr<Shard>> _shards;
+    std::atomic<size_t> _edge_count{0};
+    std::atomic<size_t> _target_count{0};
+    std::atomic<size_t> _aged_target_count{0};
+};
+
+struct OversizeNodeRecord {
+    uint32_t first_epoch = 0;
+    uint32_t last_epoch = 0;
+    uint32_t last_degree = 0;
+};
+
+class OversizeNodeTable {
+ public:
+    OversizeNodeTable();
+    void note(uint32_t node_id, uint32_t degree, uint32_t epoch);
+    void erase(uint32_t node_id);
+    size_t size() const;
+    bool has_aged(uint32_t current_epoch, uint32_t age_threshold_rounds) const;
+    std::vector<uint32_t> collect_candidates(uint32_t current_epoch,
+                                             uint32_t age_threshold_rounds,
+                                             size_t limit) const;
+ private:
+    struct Shard {
+        mutable std::mutex mtx;
+        tsl::robin_map<uint32_t, OversizeNodeRecord> nodes;
+    };
+
+    size_t shard_index(uint32_t node_id) const;
+
+    static constexpr size_t kShardCount = 64;
+    std::vector<std::unique_ptr<Shard>> _shards;
+    std::atomic<size_t> _size{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -214,7 +268,8 @@ class BufferPool {
               float region_query_frac  = 0.65f,
               float region_update_frac = 0.25f,
               uint32_t flush_budget_pages_per_cycle = 32,
-              uint32_t flush_wakeup_ms = 100);
+              uint32_t flush_wakeup_ms = 100,
+              bool truncate_heap = true);
 
     PageFrame& pin(uint32_t page_id,
                    FrameRegion hint = FrameRegion::QUERY);
@@ -230,6 +285,8 @@ class BufferPool {
     void start_bg_flush(float high_wm = 0.70f, float low_wm = 0.30f);
     void stop_bg_flush();
     void reset();
+    uint32_t dirty_page_count() const;
+    double dirty_ratio() const;
 
     uint32_t page_size() const { return _page_size; }
     uint32_t num_frames() const { return _num_frames; }
@@ -295,7 +352,8 @@ class InPlaceGraphStore {
               float bp_query_frac  = 0.65f,
               float bp_update_frac = 0.25f,
               uint32_t flush_budget_pages_per_cycle = 32,
-              uint32_t flush_wakeup_ms = 100);
+              uint32_t flush_wakeup_ms = 100,
+              bool truncate_heap = true);
 
     // PQ support
     void load_pq_from_disk_index(const std::string& pq_prefix,
@@ -322,6 +380,9 @@ class InPlaceGraphStore {
                                 std::vector<uint8_t>& found,
                                 std::vector<uint8_t>* flags_out = nullptr,
                                 bool resident_only = false);
+    void     batch_fetch_frontier_neighbors(const std::vector<unsigned>& ids,
+                                            std::vector<std::vector<unsigned>>& neighbors,
+                                            std::vector<uint8_t>& found);
 
     // Allocation
     void     allocate_node(uint32_t node_id);
@@ -338,10 +399,26 @@ class InPlaceGraphStore {
 
     // Deferred reverse edges
     void defer_reverse_edge(uint32_t target, uint32_t src);
+    void append_pending_reverse_neighbors(uint32_t target, std::vector<unsigned>& out) const;
+    void note_oversized_node(uint32_t node_id, uint32_t degree);
+    void clear_oversized_node(uint32_t node_id);
+    void set_maintenance_epoch(uint32_t epoch);
+    uint32_t maintenance_epoch() const;
+    bool has_aged_oversized_nodes(uint32_t age_threshold_rounds) const;
+    size_t pending_oversized_nodes() const;
+    size_t repair_queue_backlog() const;
+    uint32_t dirty_page_count() const;
     template<typename T>
     void drain_deferred_edges(unsigned R, unsigned C, float alpha,
+                              unsigned slack,
                               unsigned aligned_dim,
+                              uint32_t max_targets,
                               diskann::Distance<T>* dist);
+    template<typename T>
+    uint32_t prune_oversized_nodes(uint32_t budget, unsigned R, unsigned C,
+                                   float alpha, unsigned aligned_dim,
+                                   uint32_t age_threshold_rounds,
+                                   diskann::Distance<T>* dist);
 
     // Sweep-based delete repair
     template<typename T>
@@ -360,10 +437,14 @@ class InPlaceGraphStore {
     void start_bg_flush();
     void stop_bg_flush();
     void flush();
+    double dirty_ratio() const;
     void set_entry_point(uint32_t entry_point);
+    void save_snapshot(const std::string& meta_path) const;
+    void load_snapshot(const std::string& meta_path);
 
     // Stats + info
     InPlaceIOStats& stats() { return _stats; }
+    const InPlaceIOStats& stats() const { return _stats; }
     uint32_t entry_point() const { return _entry_point; }
     uint32_t num_active() const;
     uint32_t aligned_dim() const { return _aligned_dim; }
@@ -378,6 +459,7 @@ class InPlaceGraphStore {
     size_t buffer_pool_bytes() const;
     size_t locator_bytes() const;
     size_t deferred_edge_bytes() const;
+    size_t deferred_edge_target_count() const;
     size_t pq_data_bytes() const;
 
  private:
@@ -427,9 +509,11 @@ class InPlaceGraphStore {
     // Sweep repair state
     uint32_t _sweep_cursor     = 0;
     uint64_t _sweep_generation = 0;
+    std::atomic<uint32_t> _maintenance_epoch{0};
     std::mutex _sweep_mtx;
     tsl::robin_set<uint32_t> _new_deleted_nodes;
     tsl::robin_set<uint32_t> _quarantine_deleted_nodes;
+    OversizeNodeTable _oversized_nodes;
     mutable std::mutex _entry_mtx;
     std::vector<uint32_t> _entry_candidates;
     size_t _entry_rr_cursor = 0;

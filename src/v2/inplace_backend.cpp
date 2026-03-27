@@ -146,25 +146,221 @@ void InPlaceSearchScratch::flush_distance_stats(InPlaceIOStats& stats) {
 // ===========================================================================
 // DeferredEdgeBuffer
 // ===========================================================================
-void DeferredEdgeBuffer::push(uint32_t target, uint32_t src) {
-    std::lock_guard<std::mutex> lk(_mtx);
-    uint64_t key = (static_cast<uint64_t>(target) << 32) | static_cast<uint64_t>(src);
-    if (_seen.insert(key).second) {
-        _buffer.push_back({target, src});
+DeferredEdgeBuffer::DeferredEdgeBuffer() {
+    _shards.reserve(kShardCount);
+    for (size_t i = 0; i < kShardCount; ++i) {
+        _shards.emplace_back(std::make_unique<Shard>());
     }
 }
 
-size_t DeferredEdgeBuffer::size() const {
-    std::lock_guard<std::mutex> lk(_mtx);
-    return _buffer.size();
+size_t DeferredEdgeBuffer::shard_index(uint32_t target) const {
+    return static_cast<size_t>(target) % kShardCount;
 }
 
-std::vector<DeferredEdge> DeferredEdgeBuffer::drain() {
-    std::lock_guard<std::mutex> lk(_mtx);
-    std::vector<DeferredEdge> out;
-    out.swap(_buffer);
-    _seen.clear();
-    return out;
+size_t DeferredEdgeBuffer::push(uint32_t target, uint32_t src, uint32_t append_epoch) {
+    auto& shard = *_shards[shard_index(target)];
+    std::lock_guard<std::mutex> lk(shard.mtx);
+    auto it = shard.target_to_state.find(target);
+    bool inserted_target = (it == shard.target_to_state.end());
+    auto& state = inserted_target ? shard.target_to_state[target] : it.value();
+    auto& sources = state.sources;
+    if (std::find(sources.begin(), sources.end(), src) == sources.end()) {
+        sources.push_back(src);
+        _edge_count.fetch_add(1, std::memory_order_relaxed);
+        if (inserted_target) {
+            _target_count.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    state.last_append_epoch = append_epoch;
+    return sources.size();
+}
+
+size_t DeferredEdgeBuffer::size() const {
+    return _edge_count.load(std::memory_order_relaxed);
+}
+
+size_t DeferredEdgeBuffer::target_count() const {
+    return _target_count.load(std::memory_order_relaxed);
+}
+
+size_t DeferredEdgeBuffer::aged_target_count() const {
+    return _aged_target_count.load(std::memory_order_relaxed);
+}
+
+void DeferredEdgeBuffer::snapshot(uint32_t target, std::vector<uint32_t>& out) const {
+    auto& shard = *_shards[shard_index(target)];
+    std::lock_guard<std::mutex> lk(shard.mtx);
+    auto it = shard.target_to_state.find(target);
+    if (it == shard.target_to_state.end()) return;
+    out.insert(out.end(), it->second.sources.begin(), it->second.sources.end());
+}
+
+std::vector<uint32_t> DeferredEdgeBuffer::select_targets_for_repair(
+    uint32_t pending_threshold,
+    size_t limit,
+    bool force_all) {
+    std::vector<uint32_t> targets;
+    if (limit != 0) {
+        targets.reserve(limit);
+    } else {
+        targets.reserve(target_count());
+    }
+    auto try_select = [&](bool aged_pass) {
+        for (auto& shard_ptr : _shards) {
+            auto& shard = *shard_ptr;
+            std::lock_guard<std::mutex> lk(shard.mtx);
+            for (auto it = shard.target_to_state.begin(); it != shard.target_to_state.end(); ++it) {
+                auto& state = it.value();
+                if (state.selected) continue;
+                bool aged = state.scan_age_bit == 1;
+                bool over_threshold =
+                    state.sources.size() > static_cast<size_t>(pending_threshold);
+                bool select = force_all || (aged_pass ? aged : (!aged && over_threshold));
+                if (select && (limit == 0 || targets.size() < limit)) {
+                    state.selected = true;
+                    targets.push_back(it.key());
+                    continue;
+                }
+                if (!force_all && !aged_pass && state.scan_age_bit == 0) {
+                    state.scan_age_bit = 1;
+                    _aged_target_count.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+    };
+    try_select(true);
+    if (!force_all && limit != 0 && targets.size() >= limit) {
+        return targets;
+    }
+    try_select(false);
+    return targets;
+}
+
+size_t DeferredEdgeBuffer::finish_target(
+    uint32_t target,
+    const std::vector<uint32_t>& remove_sources,
+    bool set_scan_age_bit) {
+    auto& shard = *_shards[shard_index(target)];
+    std::lock_guard<std::mutex> lk(shard.mtx);
+    auto it = shard.target_to_state.find(target);
+    if (it == shard.target_to_state.end()) return 0;
+
+    auto& state = it.value();
+    bool was_aged = state.scan_age_bit != 0;
+    if (!remove_sources.empty()) {
+        tsl::robin_set<uint32_t> remove_set;
+        remove_set.reserve(remove_sources.size());
+        for (uint32_t src : remove_sources) {
+            remove_set.insert(src);
+        }
+        auto erase_begin = std::remove_if(
+            state.sources.begin(), state.sources.end(),
+            [&remove_set](uint32_t src) { return remove_set.find(src) != remove_set.end(); });
+        size_t removed = static_cast<size_t>(state.sources.end() - erase_begin);
+        if (removed > 0) {
+            state.sources.erase(erase_begin, state.sources.end());
+            _edge_count.fetch_sub(removed, std::memory_order_relaxed);
+        }
+    }
+
+    state.selected = false;
+    bool keep_age = set_scan_age_bit && !state.sources.empty();
+    state.scan_age_bit = keep_age ? 1 : 0;
+    if (was_aged && !keep_age) {
+        _aged_target_count.fetch_sub(1, std::memory_order_relaxed);
+    } else if (!was_aged && keep_age) {
+        _aged_target_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (state.sources.empty()) {
+        shard.target_to_state.erase(it);
+        _target_count.fetch_sub(1, std::memory_order_relaxed);
+        return 0;
+    }
+    return state.sources.size();
+}
+
+OversizeNodeTable::OversizeNodeTable() {
+    _shards.reserve(kShardCount);
+    for (size_t i = 0; i < kShardCount; ++i) {
+        _shards.emplace_back(std::make_unique<Shard>());
+    }
+}
+
+size_t OversizeNodeTable::shard_index(uint32_t node_id) const {
+    return static_cast<size_t>(node_id) % kShardCount;
+}
+
+void OversizeNodeTable::note(uint32_t node_id, uint32_t degree, uint32_t epoch) {
+    auto& shard = *_shards[shard_index(node_id)];
+    std::lock_guard<std::mutex> lk(shard.mtx);
+    auto it = shard.nodes.find(node_id);
+    if (it == shard.nodes.end()) {
+        shard.nodes[node_id] = OversizeNodeRecord{epoch, epoch, degree};
+        _size.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    auto& record = shard.nodes[node_id];
+    record.last_epoch = epoch;
+    record.last_degree = degree;
+}
+
+void OversizeNodeTable::erase(uint32_t node_id) {
+    auto& shard = *_shards[shard_index(node_id)];
+    std::lock_guard<std::mutex> lk(shard.mtx);
+    auto it = shard.nodes.find(node_id);
+    if (it == shard.nodes.end()) return;
+    shard.nodes.erase(it);
+    _size.fetch_sub(1, std::memory_order_relaxed);
+}
+
+size_t OversizeNodeTable::size() const {
+    return _size.load(std::memory_order_relaxed);
+}
+
+bool OversizeNodeTable::has_aged(uint32_t current_epoch, uint32_t age_threshold_rounds) const {
+    if (age_threshold_rounds == 0) return size() > 0;
+    for (const auto& shard_ptr : _shards) {
+        auto& shard = *shard_ptr;
+        std::lock_guard<std::mutex> lk(shard.mtx);
+        for (const auto& kv : shard.nodes) {
+            if (current_epoch >= kv.second.first_epoch &&
+                current_epoch - kv.second.first_epoch >= age_threshold_rounds) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+std::vector<uint32_t> OversizeNodeTable::collect_candidates(
+    uint32_t current_epoch,
+    uint32_t age_threshold_rounds,
+    size_t limit) const {
+    std::vector<uint32_t> aged;
+    std::vector<uint32_t> fallback;
+    aged.reserve(limit == 0 ? size() : limit);
+    fallback.reserve(limit == 0 ? size() : limit);
+    for (const auto& shard_ptr : _shards) {
+        auto& shard = *shard_ptr;
+        std::lock_guard<std::mutex> lk(shard.mtx);
+        for (const auto& kv : shard.nodes) {
+            bool old_enough = age_threshold_rounds == 0 ||
+                              (current_epoch >= kv.second.first_epoch &&
+                               current_epoch - kv.second.first_epoch >= age_threshold_rounds);
+            if (old_enough) {
+                aged.push_back(kv.first);
+                if (limit != 0 && aged.size() >= limit) return aged;
+            } else if (limit == 0 || fallback.size() < limit) {
+                fallback.push_back(kv.first);
+            }
+        }
+    }
+    if (limit != 0 && aged.size() + fallback.size() > limit) {
+        fallback.resize(limit - aged.size());
+    }
+    aged.insert(aged.end(), fallback.begin(), fallback.end());
+    return aged;
 }
 
 // ===========================================================================
@@ -188,7 +384,8 @@ void BufferPool::init(uint32_t page_size, uint32_t num_frames,
                       const std::string& heap_path, InPlaceIOStats* stats,
                       float region_query_frac, float region_update_frac,
                       uint32_t flush_budget_pages_per_cycle,
-                      uint32_t flush_wakeup_ms) {
+                      uint32_t flush_wakeup_ms,
+                      bool truncate_heap) {
     _page_size  = page_size;
     _num_frames = num_frames;
     _stats      = stats;
@@ -224,13 +421,27 @@ void BufferPool::init(uint32_t page_size, uint32_t num_frames,
         frame_begin = frame_end;
     }
 
-    _heap_fd = ::open(heap_path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_DIRECT | O_LARGEFILE, 0644);
+    int open_flags = O_RDWR | O_CREAT | O_DIRECT | O_LARGEFILE;
+    if (truncate_heap) open_flags |= O_TRUNC;
+    _heap_fd = ::open(heap_path.c_str(), open_flags, 0644);
     if (_heap_fd < 0) {
-        _heap_fd = ::open(heap_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        open_flags = O_RDWR | O_CREAT;
+        if (truncate_heap) open_flags |= O_TRUNC;
+        _heap_fd = ::open(heap_path.c_str(), open_flags, 0644);
     }
     if (_heap_fd < 0) {
         throw ANNException("Failed to open heap file: " + heap_path, -1,
                            __FUNCSIG__, __FILE__, __LINE__);
+    }
+    if (truncate_heap) {
+        _next_page = 0;
+    } else {
+        struct stat st;
+        if (::fstat(_heap_fd, &st) != 0) {
+            throw ANNException("Failed to stat heap file: " + heap_path, -1,
+                               __FUNCSIG__, __FILE__, __LINE__);
+        }
+        _next_page = static_cast<uint32_t>((st.st_size + _page_size - 1) / _page_size);
     }
 }
 
@@ -531,6 +742,21 @@ void BufferPool::flush_all_dirty() {
     }
 }
 
+uint32_t BufferPool::dirty_page_count() const {
+    uint32_t dirty_count = 0;
+    for (const auto& f : _frames) {
+        if (f.page_id != INVALID_PAGE && f.dirty.load(std::memory_order_acquire)) {
+            dirty_count++;
+        }
+    }
+    return dirty_count;
+}
+
+double BufferPool::dirty_ratio() const {
+    if (_num_frames == 0) return 0.0;
+    return static_cast<double>(dirty_page_count()) / static_cast<double>(_num_frames);
+}
+
 uint32_t BufferPool::allocate_page() {
     std::lock_guard<std::mutex> lk(_alloc_mtx);
     uint32_t pid = _next_page++;
@@ -694,7 +920,8 @@ void InPlaceGraphStore::init(uint32_t dim, uint32_t Mmax,
                              const std::string& heap_path,
                              float bp_query_frac, float bp_update_frac,
                              uint32_t flush_budget_pages_per_cycle,
-                             uint32_t flush_wakeup_ms) {
+                             uint32_t flush_wakeup_ms,
+                             bool truncate_heap) {
     _dim       = dim;
     _aligned_dim = (uint32_t)ROUND_UP(dim, 8);
     _Mmax      = Mmax;
@@ -721,7 +948,7 @@ void InPlaceGraphStore::init(uint32_t dim, uint32_t Mmax,
 
     _bp.init(page_size, buffer_pool_frames, heap_path, &_stats,
              bp_query_frac, bp_update_frac,
-             flush_budget_pages_per_cycle, flush_wakeup_ms);
+             flush_budget_pages_per_cycle, flush_wakeup_ms, truncate_heap);
 }
 
 uint32_t InPlaceGraphStore::bitmap_bytes() const {
@@ -1030,6 +1257,68 @@ void InPlaceGraphStore::batch_fetch_coords(const std::vector<uint32_t>& ids,
     }
 }
 
+void InPlaceGraphStore::batch_fetch_frontier_neighbors(
+    const std::vector<unsigned>& ids,
+    std::vector<std::vector<unsigned>>& neighbors,
+    std::vector<uint8_t>& found) {
+    neighbors.clear();
+    neighbors.resize(ids.size());
+    found.assign(ids.size(), 0);
+    if (ids.empty()) return;
+
+    struct BatchItem {
+        uint32_t page_id;
+        uint16_t slot_idx;
+        uint32_t node_id;
+        size_t out_idx;
+    };
+
+    std::vector<BatchItem> items;
+    items.reserve(ids.size());
+    {
+        std::lock_guard<std::mutex> lk(_alloc_mtx);
+        for (size_t i = 0; i < ids.size(); ++i) {
+            uint32_t node_id = ids[i];
+            if (node_id >= _node_to_rid.size()) continue;
+            RID rid = _node_to_rid[node_id];
+            if (rid.page_id == INVALID_PAGE) continue;
+            items.push_back(BatchItem{rid.page_id, rid.slot_idx, node_id, i});
+        }
+    }
+    std::sort(items.begin(), items.end(), [](const BatchItem& a, const BatchItem& b) {
+        if (a.page_id != b.page_id) return a.page_id < b.page_id;
+        return a.slot_idx < b.slot_idx;
+    });
+
+    size_t cursor = 0;
+    while (cursor < items.size()) {
+        uint32_t page_id = items[cursor].page_id;
+        auto& frame = _bp.pin(page_id, FrameRegion::QUERY);
+        while (cursor < items.size() && items[cursor].page_id == page_id) {
+            const auto& item = items[cursor];
+            char* slot_ptr = frame.data + header_bytes() + item.slot_idx * _slot_size;
+            PackedSlotHeader hdr;
+            memcpy(&hdr, slot_ptr, sizeof(hdr));
+            if (hdr.node_id == item.node_id && !(hdr.flags & FLAG_DELETED)) {
+                uint32_t* nbrs_ptr = reinterpret_cast<uint32_t*>(
+                    slot_ptr + sizeof(PackedSlotHeader) + _aligned_dim * _elem_size);
+                auto& out = neighbors[item.out_idx];
+                out.reserve(hdr.degree);
+                for (uint16_t j = 0; j < hdr.degree; ++j) {
+                    out.push_back(nbrs_ptr[j]);
+                }
+                found[item.out_idx] = 1;
+                _stats.logical_bytes_read.fetch_add(
+                    sizeof(PackedSlotHeader) + static_cast<uint64_t>(_aligned_dim) * _elem_size +
+                    static_cast<uint64_t>(hdr.degree) * sizeof(uint32_t),
+                    std::memory_order_relaxed);
+            }
+            ++cursor;
+        }
+        _bp.unpin(page_id, false);
+    }
+}
+
 void InPlaceGraphStore::mark_deleted(uint32_t node_id) {
     auto view = pin_node(node_id, WRITE);
     if (view._page_id == INVALID_PAGE) return;
@@ -1046,6 +1335,7 @@ void InPlaceGraphStore::mark_deleted(uint32_t node_id) {
         std::lock_guard<std::mutex> lk(_sweep_mtx);
         _new_deleted_nodes.insert(node_id);
     }
+    clear_oversized_node(node_id);
     if (node_id == _entry_point) {
         uint32_t replacement = INVALID_NODE;
         {
@@ -1158,8 +1448,49 @@ void InPlaceGraphStore::encode_pq(uint32_t node_id, const float* coords) {
 }
 
 void InPlaceGraphStore::defer_reverse_edge(uint32_t target, uint32_t src) {
-    _deferred_edges.push(target, src);
+    _deferred_edges.push(target, src, maintenance_epoch());
     _stats.deferred_edges_pushed.fetch_add(1);
+}
+
+void InPlaceGraphStore::append_pending_reverse_neighbors(uint32_t target, std::vector<unsigned>& out) const {
+    std::vector<uint32_t> pending;
+    pending.reserve(8);
+    _deferred_edges.snapshot(target, pending);
+    for (uint32_t src : pending) {
+        out.push_back(src);
+    }
+}
+
+void InPlaceGraphStore::note_oversized_node(uint32_t node_id, uint32_t degree) {
+    _oversized_nodes.note(node_id, degree, maintenance_epoch());
+}
+
+void InPlaceGraphStore::clear_oversized_node(uint32_t node_id) {
+    _oversized_nodes.erase(node_id);
+}
+
+void InPlaceGraphStore::set_maintenance_epoch(uint32_t epoch) {
+    _maintenance_epoch.store(epoch, std::memory_order_relaxed);
+}
+
+uint32_t InPlaceGraphStore::maintenance_epoch() const {
+    return _maintenance_epoch.load(std::memory_order_relaxed);
+}
+
+bool InPlaceGraphStore::has_aged_oversized_nodes(uint32_t age_threshold_rounds) const {
+    return _oversized_nodes.has_aged(maintenance_epoch(), age_threshold_rounds);
+}
+
+size_t InPlaceGraphStore::pending_oversized_nodes() const {
+    return _oversized_nodes.size();
+}
+
+size_t InPlaceGraphStore::repair_queue_backlog() const {
+    return _deferred_edges.aged_target_count();
+}
+
+uint32_t InPlaceGraphStore::dirty_page_count() const {
+    return _bp.dirty_page_count();
 }
 
 void InPlaceGraphStore::reclaim_quarantined() {
@@ -1290,8 +1621,166 @@ void InPlaceGraphStore::warmup_bfs(uint32_t entry_point, uint32_t num_nodes) {
 void InPlaceGraphStore::start_bg_flush() { _bp.start_bg_flush(); }
 void InPlaceGraphStore::stop_bg_flush()  { _bp.stop_bg_flush(); }
 void InPlaceGraphStore::flush()          { _bp.flush_all_dirty(); }
+double InPlaceGraphStore::dirty_ratio() const { return _bp.dirty_ratio(); }
 void InPlaceGraphStore::set_entry_point(uint32_t entry_point) {
     if (is_active(entry_point)) _entry_point = entry_point;
+}
+
+void InPlaceGraphStore::save_snapshot(const std::string& meta_path) const {
+    struct SnapshotHeader {
+        char magic[8];
+        uint32_t version;
+        uint32_t dim;
+        uint32_t aligned_dim;
+        uint32_t Mmax;
+        uint32_t elem_size;
+        uint32_t page_size;
+        uint32_t slot_size;
+        uint32_t slots_per_page;
+        uint32_t entry_point;
+        uint32_t max_nodes;
+        uint32_t n_chunks;
+        uint32_t num_active;
+        uint32_t total_pages;
+        uint64_t rid_size;
+        uint64_t active_cap;
+        uint64_t page_dir_size;
+        uint64_t pages_with_space_size;
+        uint64_t entry_candidates_size;
+        uint64_t entry_rr_cursor;
+    } hdr{};
+
+    memcpy(hdr.magic, "IPGSNP1", 8);
+    hdr.version = 1;
+    hdr.dim = _dim;
+    hdr.aligned_dim = _aligned_dim;
+    hdr.Mmax = _Mmax;
+    hdr.elem_size = _elem_size;
+    hdr.page_size = _page_size;
+    hdr.slot_size = _slot_size;
+    hdr.slots_per_page = _slots_per_page;
+    hdr.entry_point = _entry_point;
+    hdr.max_nodes = _max_nodes;
+    hdr.n_chunks = _n_chunks;
+    hdr.num_active = _num_active.load(std::memory_order_relaxed);
+    hdr.total_pages = _bp.next_page();
+    hdr.rid_size = _node_to_rid.size();
+    hdr.active_cap = _node_active_cap;
+    hdr.page_dir_size = _page_dir.size();
+    hdr.pages_with_space_size = _pages_with_space.size();
+    hdr.entry_candidates_size = _entry_candidates.size();
+    hdr.entry_rr_cursor = _entry_rr_cursor;
+
+    std::ofstream out(meta_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw ANNException("Failed to open snapshot file: " + meta_path, -1,
+                           __FUNCSIG__, __FILE__, __LINE__);
+    }
+    out.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+    out.write(reinterpret_cast<const char*>(_node_to_rid.data()),
+              static_cast<std::streamsize>(_node_to_rid.size() * sizeof(RID)));
+    std::vector<uint8_t> active_flags(_node_active_cap, 0);
+    for (uint32_t i = 0; i < _node_active_cap; ++i) {
+        active_flags[i] = _node_active_flags[i].load(std::memory_order_relaxed);
+    }
+    out.write(reinterpret_cast<const char*>(active_flags.data()),
+              static_cast<std::streamsize>(active_flags.size()));
+    out.write(reinterpret_cast<const char*>(_page_dir.data()),
+              static_cast<std::streamsize>(_page_dir.size() * sizeof(PageDir)));
+    for (uint32_t pid : _pages_with_space) {
+        out.write(reinterpret_cast<const char*>(&pid), sizeof(pid));
+    }
+    out.write(reinterpret_cast<const char*>(_entry_candidates.data()),
+              static_cast<std::streamsize>(_entry_candidates.size() * sizeof(uint32_t)));
+}
+
+void InPlaceGraphStore::load_snapshot(const std::string& meta_path) {
+    struct SnapshotHeader {
+        char magic[8];
+        uint32_t version;
+        uint32_t dim;
+        uint32_t aligned_dim;
+        uint32_t Mmax;
+        uint32_t elem_size;
+        uint32_t page_size;
+        uint32_t slot_size;
+        uint32_t slots_per_page;
+        uint32_t entry_point;
+        uint32_t max_nodes;
+        uint32_t n_chunks;
+        uint32_t num_active;
+        uint32_t total_pages;
+        uint64_t rid_size;
+        uint64_t active_cap;
+        uint64_t page_dir_size;
+        uint64_t pages_with_space_size;
+        uint64_t entry_candidates_size;
+        uint64_t entry_rr_cursor;
+    } hdr{};
+
+    std::ifstream in(meta_path, std::ios::binary);
+    if (!in) {
+        throw ANNException("Failed to open snapshot file: " + meta_path, -1,
+                           __FUNCSIG__, __FILE__, __LINE__);
+    }
+    in.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+    if (!in || memcmp(hdr.magic, "IPGSNP1", 8) != 0 || hdr.version != 1) {
+        throw ANNException("Invalid snapshot header: " + meta_path, -1,
+                           __FUNCSIG__, __FILE__, __LINE__);
+    }
+    if (hdr.dim != _dim || hdr.page_size != _page_size || hdr.Mmax != _Mmax ||
+        hdr.elem_size != _elem_size || hdr.slot_size != _slot_size ||
+        hdr.slots_per_page != _slots_per_page) {
+        throw ANNException("Snapshot layout mismatch: " + meta_path, -1,
+                           __FUNCSIG__, __FILE__, __LINE__);
+    }
+
+    _entry_point = hdr.entry_point;
+    _max_nodes = std::max(_max_nodes, hdr.max_nodes);
+    _n_chunks = hdr.n_chunks;
+    _num_active.store(hdr.num_active, std::memory_order_relaxed);
+    _node_to_rid.assign(static_cast<size_t>(hdr.rid_size), RID{INVALID_PAGE, 0});
+    if (!_node_to_rid.empty()) {
+        in.read(reinterpret_cast<char*>(_node_to_rid.data()),
+                static_cast<std::streamsize>(_node_to_rid.size() * sizeof(RID)));
+    }
+
+    delete[] _node_active_flags;
+    _node_active_flags = nullptr;
+    _node_active_cap = static_cast<uint32_t>(hdr.active_cap);
+    _node_active_flags = new std::atomic<uint8_t>[_node_active_cap];
+    std::vector<uint8_t> active_flags(_node_active_cap, 0);
+    if (!active_flags.empty()) {
+        in.read(reinterpret_cast<char*>(active_flags.data()),
+                static_cast<std::streamsize>(active_flags.size()));
+    }
+    for (uint32_t i = 0; i < _node_active_cap; ++i) {
+        _node_active_flags[i].store(active_flags[i], std::memory_order_relaxed);
+    }
+
+    _page_dir.assign(static_cast<size_t>(hdr.page_dir_size), PageDir{0, 0});
+    if (!_page_dir.empty()) {
+        in.read(reinterpret_cast<char*>(_page_dir.data()),
+                static_cast<std::streamsize>(_page_dir.size() * sizeof(PageDir)));
+    }
+
+    _pages_with_space.clear();
+    for (uint64_t i = 0; i < hdr.pages_with_space_size; ++i) {
+        uint32_t pid = 0;
+        in.read(reinterpret_cast<char*>(&pid), sizeof(pid));
+        _pages_with_space.insert(pid);
+    }
+
+    _entry_candidates.assign(static_cast<size_t>(hdr.entry_candidates_size), 0);
+    if (!_entry_candidates.empty()) {
+        in.read(reinterpret_cast<char*>(_entry_candidates.data()),
+                static_cast<std::streamsize>(_entry_candidates.size() * sizeof(uint32_t)));
+    }
+    _entry_rr_cursor = static_cast<size_t>(hdr.entry_rr_cursor);
+    _sweep_cursor = 0;
+    _sweep_generation = 0;
+    _new_deleted_nodes.clear();
+    _quarantine_deleted_nodes.clear();
 }
 
 size_t InPlaceGraphStore::memory_usage_bytes() const {
@@ -1316,6 +1805,10 @@ size_t InPlaceGraphStore::locator_bytes() const {
 
 size_t InPlaceGraphStore::deferred_edge_bytes() const {
     return _deferred_edges.size() * sizeof(DeferredEdge);
+}
+
+size_t InPlaceGraphStore::deferred_edge_target_count() const {
+    return _deferred_edges.target_count();
 }
 
 size_t InPlaceGraphStore::pq_data_bytes() const {

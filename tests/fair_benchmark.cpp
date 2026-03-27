@@ -3,11 +3,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -30,6 +33,40 @@ namespace {
 
 static bool path_exists(const std::string &path);
 
+static bool workload_has_query(const std::string &workload) {
+  return workload == "query_only" || workload == "query_update_round" ||
+         workload == "query_insert_round" || workload == "query_delete_round";
+}
+
+static bool workload_has_inserts(const std::string &workload) {
+  return workload == "update_only" || workload == "query_update_round" ||
+         workload == "query_insert_round";
+}
+
+static bool workload_has_deletes(const std::string &workload) {
+  return workload == "update_only" || workload == "query_update_round" ||
+         workload == "query_delete_round";
+}
+
+static uint64_t file_size_if_exists(const std::string &path) {
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0) return 0;
+  return static_cast<uint64_t>(st.st_size);
+}
+
+static uint64_t inplace_aux_index_artifact_bytes(const std::string &pq_prefix) {
+  uint64_t total = 0;
+  const std::vector<std::string> suffixes = {
+      "_pq_compressed.bin",
+      "_pq_pivots.bin",
+      "_pq_pivots.bin_centroid.bin",
+      "_pq_pivots.bin_rearrangement_perm.bin",
+      "_pq_pivots.bin_chunk_offsets.bin",
+  };
+  for (const auto &suffix : suffixes) total += file_size_if_exists(pq_prefix + suffix);
+  return total;
+}
+
 struct ProcIo {
   uint64_t read_bytes = 0;
   uint64_t write_bytes = 0;
@@ -40,6 +77,15 @@ struct ProcMem {
   double peak_rss_kb = 0;
 };
 
+struct NativeIOSnapshot {
+  uint64_t physical_bytes_read = 0;
+  uint64_t physical_bytes_written = 0;
+  uint64_t logical_bytes_read = 0;
+  uint64_t logical_bytes_written = 0;
+  uint64_t pages_flushed = 0;
+  uint64_t dirty_page_bytes_flushed = 0;
+};
+
 struct CacheSnapshot {
   uint64_t hits = 0;
   uint64_t misses = 0;
@@ -47,6 +93,7 @@ struct CacheSnapshot {
 
 struct SearchMetrics {
   double qps = 0;
+  double query_wall_time_s = 0;
   double lat_avg_us = 0;
   double lat_p50_us = 0;
   double lat_p95_us = 0;
@@ -58,6 +105,8 @@ struct SearchMetrics {
   uint64_t query_cache_hits = 0;
   uint64_t query_cache_misses = 0;
   double query_cache_hit_rate = 0;
+  uint32_t candidate_pool_L_effective = 0;
+  uint32_t pq_frontier_confirm_topk_effective = 0;
 };
 struct BatchMetrics {
   double insert_throughput = 0;
@@ -94,6 +143,21 @@ static std::vector<unsigned> load_medoids_file(const std::string &path) {
   return medoids;
 }
 
+static void save_medoids_file(const std::string &path,
+                              const std::vector<unsigned> &medoids) {
+  if (medoids.empty()) return;
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    throw std::runtime_error("failed to open medoids file: " + path);
+  }
+  int32_t rows = static_cast<int32_t>(medoids.size());
+  int32_t cols = 1;
+  out.write(reinterpret_cast<const char *>(&rows), sizeof(rows));
+  out.write(reinterpret_cast<const char *>(&cols), sizeof(cols));
+  out.write(reinterpret_cast<const char *>(medoids.data()),
+            static_cast<std::streamsize>(medoids.size() * sizeof(uint32_t)));
+}
+
 template <typename T>
 static std::vector<unsigned> build_disk_stream_index(
     const std::string &base_bin, const std::string &build_temp_root,
@@ -107,7 +171,14 @@ static std::vector<unsigned> build_disk_stream_index(
   const std::string mem_index_path = prefix + "_mem.index";
   const std::string medoids_path = prefix + "_medoids.bin";
   const std::string centroids_path = prefix + "_centroids.bin";
-  const double sampling_rate = 0.1;
+  size_t training_set_size =
+      diskann::PQ_TRAINING_SET_FRACTION * npts > diskann::MAX_PQ_TRAINING_SET_SIZE
+          ? diskann::MAX_PQ_TRAINING_SET_SIZE
+          : static_cast<size_t>(std::round(diskann::PQ_TRAINING_SET_FRACTION * npts));
+  training_set_size = std::max<size_t>(1, training_set_size);
+  const double sampling_rate =
+      npts > 0 ? static_cast<double>(training_set_size) / static_cast<double>(npts) : 1.0;
+  (void)build_threads;
   if (diskann::build_merged_vamana_index<T>(base_bin, diskann::Metric::L2, false,
                                             L, R, sampling_rate,
                                             memory_budget_gb, mem_index_path,
@@ -215,7 +286,8 @@ static std::vector<unsigned> gather_start_ids(InPlaceGraphStore &store, uint32_t
     if (std::find(init_ids.begin(), init_ids.end(), id) == init_ids.end()) init_ids.push_back(id);
   };
   uint32_t entry = store.entry_point();
-  if (entry_init_mode == "medoid" || entry_init_mode == "medoid_plus_neighbors") {
+  if (entry_init_mode == "medoid" || entry_init_mode == "medoid_only" ||
+      entry_init_mode == "medoid_plus_neighbors") {
     for (uint32_t medoid : medoids) {
       add_seed(medoid);
       if (init_ids.size() >= beamwidth) break;
@@ -273,6 +345,18 @@ static ProcIo read_proc_io() {
     if (key == "read_bytes:") io.read_bytes = value;
     if (key == "write_bytes:") io.write_bytes = value;
   }
+  return io;
+}
+
+static NativeIOSnapshot read_native_io(const InPlaceGraphStore &store) {
+  const auto &stats = store.stats();
+  NativeIOSnapshot io;
+  io.physical_bytes_read = stats.physical_bytes_read.load();
+  io.physical_bytes_written = stats.physical_bytes_written.load();
+  io.logical_bytes_read = stats.logical_bytes_read.load();
+  io.logical_bytes_written = stats.logical_bytes_written.load();
+  io.pages_flushed = stats.pages_flushed.load();
+  io.dirty_page_bytes_flushed = stats.dirty_page_bytes_flushed.load();
   return io;
 }
 
@@ -381,6 +465,30 @@ static uint32_t compute_sweep_budget(const std::string &mode, uint32_t configure
   return fallback;
 }
 
+static uint32_t internal_query_pool_L(uint32_t search_L, uint32_t recall_at,
+                                      uint32_t beamwidth,
+                                      uint32_t pq_confirm_topk,
+                                      const std::string &query_pool_mode,
+                                      uint32_t query_pool_slack) {
+  uint32_t safety_floor = std::max<uint32_t>(1, std::max<uint32_t>(recall_at, beamwidth));
+  if (query_pool_mode == "legacy") {
+    uint32_t recall_floor = std::max<uint32_t>(recall_at * 4, recall_at + beamwidth);
+    uint32_t confirm_floor = search_L + pq_confirm_topk + beamwidth;
+    return std::max<uint32_t>(search_L, std::max<uint32_t>(recall_floor, confirm_floor));
+  }
+  if (query_pool_mode == "slack") {
+    return std::max<uint32_t>(safety_floor, search_L + query_pool_slack);
+  }
+  return std::max<uint32_t>(safety_floor, search_L);
+}
+
+static uint32_t query_confirm_topk(uint32_t configured_topk, uint32_t recall_at,
+                                   uint32_t beamwidth) {
+  (void) recall_at;
+  (void) beamwidth;
+  return configured_topk;
+}
+
 template <typename T>
 static SearchMetrics run_checkpoint_search(InPlaceGraphStore &store, const std::string &query_file,
                                            const std::string &truthset_file, uint32_t recall_at,
@@ -393,7 +501,9 @@ static SearchMetrics run_checkpoint_search(InPlaceGraphStore &store, const std::
                                            uint32_t pq_confirm_topk,
                                            const std::string &pq_confirm_mode,
                                            double pq_confirm_margin,
-                                           uint32_t pq_confirm_delta) {
+                                           uint32_t pq_confirm_delta,
+                                           const std::string &query_pool_mode,
+                                           uint32_t query_pool_slack) {
   T *query = nullptr;
   size_t query_num = 0, query_dim = 0, query_aligned_dim = 0;
   diskann::load_aligned_bin<T>(query_file, query, query_num, query_dim, query_aligned_dim);
@@ -406,6 +516,11 @@ static SearchMetrics run_checkpoint_search(InPlaceGraphStore &store, const std::
   uint64_t q_ops0 = store.stats().query_distance_ops.load();
   uint64_t p_read0 = store.stats().physical_bytes_read.load();
   CacheSnapshot cache0 = read_query_cache(store);
+  uint32_t candidate_pool_L = internal_query_pool_L(search_L, recall_at, beamwidth,
+                                                    pq_confirm_topk,
+                                                    query_pool_mode,
+                                                    query_pool_slack);
+  uint32_t confirm_topk = query_confirm_topk(pq_confirm_topk, recall_at, beamwidth);
   std::vector<unsigned> init_ids = gather_start_ids(store, beamwidth, medoids, entry_init_mode);
   if (init_ids.empty() && store.is_active(store.entry_point())) {
     init_ids.push_back(static_cast<unsigned>(store.entry_point()));
@@ -423,10 +538,10 @@ static SearchMetrics run_checkpoint_search(InPlaceGraphStore &store, const std::
       for (int64_t i = 0; i < static_cast<int64_t>(std::min<size_t>(query_num, warmup_query_count)); ++i) {
         std::vector<diskann::Neighbor> results;
         scratch.reset();
-        graph_iterate_to_fixed_point<T>(query + i * query_aligned_dim, search_L,
+        graph_iterate_to_fixed_point<T>(query + i * query_aligned_dim, candidate_pool_L,
                                         init_ids, beamwidth,
                                         &store, aligned_dim, dist_cmp, &scratch, results,
-                                        nullptr, DistanceScope::QUERY, pq_confirm_topk,
+                                        nullptr, DistanceScope::QUERY, confirm_topk,
                                         pq_confirm_mode, pq_confirm_margin, pq_confirm_delta);
         scratch.reset();
       }
@@ -443,10 +558,10 @@ static SearchMetrics run_checkpoint_search(InPlaceGraphStore &store, const std::
     auto q0 = std::chrono::high_resolution_clock::now();
     std::vector<diskann::Neighbor> results;
     scratch.reset();
-    graph_iterate_to_fixed_point<T>(query + i * query_aligned_dim, search_L,
+    graph_iterate_to_fixed_point<T>(query + i * query_aligned_dim, candidate_pool_L,
                                     init_ids, beamwidth,
                                     &store, aligned_dim, dist_cmp, &scratch, results,
-                                    nullptr, DistanceScope::QUERY, pq_confirm_topk,
+                                    nullptr, DistanceScope::QUERY, confirm_topk,
                                     pq_confirm_mode, pq_confirm_margin, pq_confirm_delta);
     scratch.flush_distance_stats(store.stats());
     auto q1 = std::chrono::high_resolution_clock::now();
@@ -464,6 +579,7 @@ static SearchMetrics run_checkpoint_search(InPlaceGraphStore &store, const std::
 
   SearchMetrics m;
   double elapsed_s = std::chrono::duration<double>(end - begin).count();
+  m.query_wall_time_s = elapsed_s;
   double total_lat = std::accumulate(latency_us.begin(), latency_us.end(), 0.0);
   m.qps = elapsed_s > 0 ? static_cast<double>(query_num) / elapsed_s : 0.0;
   m.lat_avg_us = query_num > 0 ? total_lat / static_cast<double>(query_num) : 0.0;
@@ -481,6 +597,8 @@ static SearchMetrics run_checkpoint_search(InPlaceGraphStore &store, const std::
   m.query_cache_hit_rate = cache_accesses > 0 ? (100.0 * static_cast<double>(m.query_cache_hits) /
                                                  static_cast<double>(cache_accesses))
                                               : 0.0;
+  m.candidate_pool_L_effective = candidate_pool_L;
+  m.pq_frontier_confirm_topk_effective = confirm_topk;
   uint64_t p_read1 = store.stats().physical_bytes_read.load();
   uint64_t pages_read = store.page_size() > 0 ? (p_read1 - p_read0) / store.page_size() : 0;
   m.disk_ios = query_num > 0 ? static_cast<double>(pages_read) / static_cast<double>(query_num) : 0.0;
@@ -516,14 +634,29 @@ static void append_row(std::ofstream &out, const std::string &workload,
                        uint32_t checkpoint_id, uint32_t round_index,
                        uint32_t base_points, uint32_t active_points,
                        uint32_t cumulative_inserts, uint32_t cumulative_deletes,
-                       uint32_t recall_at, uint32_t search_L,
+                       uint32_t recall_at, uint32_t search_L, uint32_t beamwidth,
                        const SearchMetrics &search, const BatchMetrics &batch,
+                       uint64_t disk_size_bytes, uint64_t aux_size_bytes,
                        const ProcIo &io_start, const ProcIo &io_prev, const ProcIo &io_cur,
-                       const ProcMem &mem, const std::string &notes) {
+                       const NativeIOSnapshot &native_start,
+                       const NativeIOSnapshot &native_prev,
+                       const NativeIOSnapshot &native_cur,
+                       const ProcMem &mem, const std::string &maintenance_policy,
+                       bool maintenance_triggered, double foreground_update_wall_time_s,
+                       double maintenance_wall_time_s, uint32_t pending_updates,
+                       const InPlaceGraphStore &store,
+                       const std::string &entry_init_mode,
+                       const std::string &query_pool_mode,
+                       uint32_t query_pool_slack,
+                       const std::string &notes) {
+  constexpr double kProcPageSize = 4096.0;
+  double checkpoint_pages_read =
+      static_cast<double>(io_cur.read_bytes - io_prev.read_bytes) / kProcPageSize;
   out << std::fixed << std::setprecision(4);
   out << "{";
   out << "\"system\":\"inplace\",";
   out << "\"workload\":\"" << workload << "\",";
+  out << "\"status\":\"ok\",";
   out << "\"checkpoint_id\":" << checkpoint_id << ",";
   out << "\"round_index\":" << round_index << ",";
   out << "\"base_points\":" << base_points << ",";
@@ -532,11 +665,20 @@ static void append_row(std::ofstream &out, const std::string &workload,
   out << "\"cumulative_deletes\":" << cumulative_deletes << ",";
   out << "\"recall_at\":" << recall_at << ",";
   out << "\"search_L\":" << search_L << ",";
+  out << "\"beamwidth\":" << beamwidth << ",";
+  out << "\"entry_init_mode\":\"" << json_escape(entry_init_mode) << "\",";
+  out << "\"query_pool_mode\":\"" << json_escape(query_pool_mode) << "\",";
+  out << "\"query_pool_slack\":" << query_pool_slack << ",";
+  out << "\"candidate_pool_L_effective\":" << search.candidate_pool_L_effective << ",";
+  out << "\"pq_frontier_confirm_topk_effective\":" << search.pq_frontier_confirm_topk_effective << ",";
   out << "\"qps\":" << search.qps << ",";
   out << "\"query_throughput\":" << search.qps << ",";
   out << "\"insert_throughput\":" << batch.insert_throughput << ",";
   out << "\"delete_throughput\":" << batch.delete_throughput << ",";
   out << "\"update_throughput\":" << batch.update_throughput << ",";
+  out << "\"query_wall_time_s\":" << search.query_wall_time_s << ",";
+  out << "\"foreground_update_wall_time_s\":" << foreground_update_wall_time_s << ",";
+  out << "\"maintenance_wall_time_s\":" << maintenance_wall_time_s << ",";
   out << "\"round_update_wall_time_s\":" << batch.round_update_wall_time_s << ",";
   out << "\"lat_avg_us\":" << search.lat_avg_us << ",";
   out << "\"lat_p50_us\":" << search.lat_p50_us << ",";
@@ -544,8 +686,35 @@ static void append_row(std::ofstream &out, const std::string &workload,
   out << "\"lat_p99_us\":" << search.lat_p99_us << ",";
   out << "\"recall\":" << search.recall << ",";
   out << "\"disk_ios\":" << search.disk_ios << ",";
+  out << "\"disk_ios_native\":" << search.disk_ios << ",";
+  out << "\"query_io_us_native\":\"\",";
+  out << "\"proc_read_pages\":" << checkpoint_pages_read << ",";
   out << "\"rss_kb\":" << mem.rss_kb << ",";
   out << "\"peak_rss_kb\":" << mem.peak_rss_kb << ",";
+  out << "\"disk_index_size_bytes\":" << disk_size_bytes << ",";
+  out << "\"aux_index_artifact_bytes\":" << aux_size_bytes << ",";
+  out << "\"index_num_nodes\":" << active_points << ",";
+  out << "\"native_index_bytes_read\":"
+      << (native_cur.physical_bytes_read - native_prev.physical_bytes_read) << ",";
+  out << "\"native_index_bytes_written\":"
+      << (native_cur.physical_bytes_written - native_prev.physical_bytes_written) << ",";
+  out << "\"cumulative_native_index_bytes_read\":"
+      << (native_cur.physical_bytes_read - native_start.physical_bytes_read) << ",";
+  out << "\"cumulative_native_index_bytes_written\":"
+      << (native_cur.physical_bytes_written - native_start.physical_bytes_written) << ",";
+  out << "\"native_pages_flushed\":"
+      << (native_cur.pages_flushed - native_prev.pages_flushed) << ",";
+  out << "\"cumulative_native_pages_flushed\":"
+      << (native_cur.pages_flushed - native_start.pages_flushed) << ",";
+  uint64_t logical_write_delta =
+      native_cur.logical_bytes_written - native_prev.logical_bytes_written;
+  uint64_t dirty_write_delta =
+      native_cur.dirty_page_bytes_flushed - native_prev.dirty_page_bytes_flushed;
+  double interval_write_amp =
+      logical_write_delta > 0 ? static_cast<double>(dirty_write_delta) /
+                                    static_cast<double>(logical_write_delta)
+                              : 0.0;
+  out << "\"native_write_amplification\":" << interval_write_amp << ",";
   out << "\"checkpoint_bytes_read\":" << (io_cur.read_bytes - io_prev.read_bytes) << ",";
   out << "\"checkpoint_bytes_written\":" << (io_cur.write_bytes - io_prev.write_bytes) << ",";
   out << "\"cumulative_bytes_read\":" << (io_cur.read_bytes - io_start.read_bytes) << ",";
@@ -555,6 +724,16 @@ static void append_row(std::ofstream &out, const std::string &workload,
   out << "\"query_cache_hit_rate\":" << search.query_cache_hit_rate << ",";
   out << "\"query_distance_us\":" << search.query_distance_us << ",";
   out << "\"query_distance_ops\":" << search.query_distance_ops << ",";
+  out << "\"maintenance_policy\":\"" << json_escape(maintenance_policy) << "\",";
+  out << "\"maintenance_triggered\":" << (maintenance_triggered ? 1 : 0) << ",";
+  out << "\"pending_updates\":" << pending_updates << ",";
+  out << "\"overlay_pending_edges\":" << (store.deferred_edge_bytes() / sizeof(DeferredEdge)) << ",";
+  out << "\"overlay_pending_targets\":" << store.deferred_edge_target_count() << ",";
+  out << "\"repair_queue_backlog\":" << store.repair_queue_backlog() << ",";
+  out << "\"oversized_node_backlog\":" << store.pending_oversized_nodes() << ",";
+  out << "\"dirty_page_count\":" << store.dirty_page_count() << ",";
+  out << "\"tombstone_count\":" << store.stats().tombstone_count.load(std::memory_order_relaxed) << ",";
+  out << "\"unsupported_reason\":\"\",";
   out << "\"notes\":\"" << json_escape(notes) << "\"";
   out << "}\n";
   out.flush();
@@ -581,46 +760,76 @@ static int run_fair(const std::string &workload, const std::string &base_bin,
                     bool drain_every_round, bool sweep_every_round,
                     const std::string &sweep_budget_mode, uint32_t sweep_budget_value,
                     bool flush_before_checkpoint, uint32_t deferred_edge_high_water_mark,
+                    uint32_t drain_high_water_mark, uint32_t oversize_slack,
+                    uint32_t oversize_prune_high_water_mark,
+                    uint32_t sweep_round_period,
+                    uint32_t sweep_deleted_threshold,
+                    uint32_t flush_round_period,
+                    double flush_dirty_ratio_threshold,
                     uint32_t pq_frontier_confirm_topk,
                     const std::string &pq_confirm_mode,
                     double pq_confirm_margin,
                     uint32_t pq_confirm_delta,
+                    const std::string &query_pool_mode,
+                    uint32_t query_pool_slack,
                     uint32_t flush_budget_pages_per_cycle,
                     uint32_t flush_wakeup_ms,
                     const std::string &build_mode,
                     float build_memory_budget_gb,
                     const std::string &build_temp_root,
-                    const std::string &entry_init_mode) {
-  T *base_data = nullptr;
-  size_t base_npts = 0, dim = 0, base_aligned_dim = 0;
-  diskann::load_aligned_bin<T>(base_bin, base_data, base_npts, dim, base_aligned_dim);
+                    const std::string &entry_init_mode,
+                    uint32_t query_only_checkpoints,
+                    bool reuse_existing_index) {
+  size_t base_npts = 0, dim = 0;
+  diskann::get_bin_metadata(base_bin, base_npts, dim);
   uint32_t aligned_dim = static_cast<uint32_t>(ROUND_UP(dim, 8));
+  uint32_t reverse_edge_overlay_high_water_mark = deferred_edge_high_water_mark;
+  uint32_t reverse_edge_overlay_target_high_water_mark = drain_high_water_mark;
+  uint32_t reverse_edge_pending_threshold = std::max<uint32_t>(1, oversize_slack);
+  uint32_t tombstone_sweep_high_water_mark = sweep_deleted_threshold;
+  uint32_t flush_dirty_page_high_water_mark = flush_round_period;
+  uint32_t store_degree_cap = std::max(build_R, prune_R);
+  std::string heap_meta_path = heap_path + ".meta";
+  std::string medoids_path = heap_path + ".medoids";
 
   InPlaceGraphStore store;
-  store.init(static_cast<uint32_t>(dim), build_R, sizeof(T), page_size, buffer_pool_frames,
+  store.init(static_cast<uint32_t>(dim), store_degree_cap, sizeof(T), page_size, buffer_pool_frames,
              heap_path,
              bp_query_frac, bp_update_frac,
-             flush_budget_pages_per_cycle, flush_wakeup_ms);
+             flush_budget_pages_per_cycle, flush_wakeup_ms,
+             !reuse_existing_index);
   ensure_diskann_family_pq<T>(full_bin, pq_prefix, pq_chunks, pq_sample_rate);
   if (pq_chunks > 0) {
     store.load_pq_from_disk_index(pq_prefix, pq_chunks);
   }
   std::vector<unsigned> medoids;
-  if (build_mode == "disk_stream") {
-    medoids = build_disk_stream_index<T>(base_bin, build_temp_root, base_points,
-                                         static_cast<uint32_t>(dim), aligned_dim,
-                                         build_R, build_L, build_threads,
-                                         build_memory_budget_gb, store);
+  if (reuse_existing_index) {
+    store.load_snapshot(heap_meta_path);
+    medoids = load_medoids_file(medoids_path);
   } else {
-    diskann::Index<T, uint32_t> mem_index(diskann::Metric::L2, dim, base_points + 1024,
-                                          false, false, false);
-    build_mem_index(base_bin, base_points, static_cast<uint32_t>(dim), aligned_dim,
-                    build_R, build_L, build_C, build_alpha, build_threads,
-                    saturate_graph, mem_index);
-    store.bulk_load_from_index(mem_index, base_points);
-    uint32_t sampled_entry = choose_sampled_entry_point(base_data, base_points, aligned_dim);
-    store.set_entry_point(sampled_entry);
-    medoids.push_back(sampled_entry);
+    if (build_mode == "disk_stream") {
+      medoids = build_disk_stream_index<T>(base_bin, build_temp_root, base_points,
+                                           static_cast<uint32_t>(dim), aligned_dim,
+                                           build_R, build_L, build_threads,
+                                           build_memory_budget_gb, store);
+    } else {
+      T *base_data = nullptr;
+      size_t base_aligned_dim = 0;
+      diskann::load_aligned_bin<T>(base_bin, base_data, base_npts, dim, base_aligned_dim);
+      diskann::Index<T, uint32_t> mem_index(diskann::Metric::L2, dim, base_points + 1024,
+                                            false, false, false);
+      build_mem_index(base_bin, base_points, static_cast<uint32_t>(dim), aligned_dim,
+                      build_R, build_L, build_C, build_alpha, build_threads,
+                      saturate_graph, mem_index);
+      store.bulk_load_from_index(mem_index, base_points);
+      uint32_t sampled_entry = choose_sampled_entry_point(base_data, base_points, aligned_dim);
+      store.set_entry_point(sampled_entry);
+      medoids.push_back(sampled_entry);
+      diskann::aligned_free(base_data);
+    }
+    store.flush();
+    store.save_snapshot(heap_meta_path);
+    save_medoids_file(medoids_path, medoids);
   }
   if (flush_after_build_before_measurement) {
     store.flush();
@@ -634,28 +843,59 @@ static int run_fair(const std::string &workload, const std::string &base_bin,
   std::ofstream out(result_jsonl, std::ios::out | std::ios::trunc);
   ProcIo io_start = read_proc_io();
   ProcIo io_prev = io_start;
+  NativeIOSnapshot native_start = read_native_io(store);
+  NativeIOSnapshot native_prev = native_start;
+  uint64_t aux_size_bytes = inplace_aux_index_artifact_bytes(pq_prefix);
   uint32_t active_points = base_points;
   uint32_t cumulative_inserts = 0;
   uint32_t cumulative_deletes = 0;
+  uint32_t pending_updates = 0;
 
-  if (workload == "query_only" || workload == "query_update_round") {
+  if (workload_has_query(workload)) {
+    if (workload == "query_only") {
+      for (uint32_t checkpoint = 0; checkpoint < std::max<uint32_t>(1, query_only_checkpoints); ++checkpoint) {
+        SearchMetrics search = run_checkpoint_search<T>(store, query_bin, gt_prefix + "0.fbin",
+                                                        recall_at, search_L, aligned_dim,
+                                                        beamwidth, medoids, entry_init_mode,
+                                                        query_threads, query_schedule,
+                                                        warmup_enabled && checkpoint == 0, warmup_query_count,
+                                                        pq_frontier_confirm_topk,
+                                                        pq_confirm_mode, pq_confirm_margin, pq_confirm_delta,
+                                                        query_pool_mode, query_pool_slack);
+        ProcIo io_cur = read_proc_io();
+        NativeIOSnapshot native_cur = read_native_io(store);
+        uint64_t disk_size = file_size_if_exists(heap_path);
+        append_row(out, workload, checkpoint, 0, base_points, active_points, 0, 0, recall_at,
+                   search_L, beamwidth, search, BatchMetrics(), disk_size, aux_size_bytes, io_start, io_prev, io_cur,
+                   native_start, native_prev, native_cur,
+                   current_mem_kb(), "native_online", false, 0.0, 0.0, 0, store,
+                   entry_init_mode, query_pool_mode, query_pool_slack,
+                   "maintenance_mode=native_online;maintenance=threshold_only");
+        io_prev = io_cur;
+        native_prev = native_cur;
+      }
+      if (bg_flush_running) store.stop_bg_flush();
+      return 0;
+    }
     SearchMetrics search = run_checkpoint_search<T>(store, query_bin, gt_prefix + "0.fbin",
                                                     recall_at, search_L, aligned_dim,
                                                     beamwidth, medoids, entry_init_mode,
                                                     query_threads, query_schedule,
                                                     warmup_enabled, warmup_query_count,
                                                     pq_frontier_confirm_topk,
-                                                    pq_confirm_mode, pq_confirm_margin, pq_confirm_delta);
+                                                    pq_confirm_mode, pq_confirm_margin, pq_confirm_delta,
+                                                    query_pool_mode, query_pool_slack);
     ProcIo io_cur = read_proc_io();
+    NativeIOSnapshot native_cur = read_native_io(store);
+    uint64_t disk_size = file_size_if_exists(heap_path);
     append_row(out, workload, 0, 0, base_points, active_points, 0, 0, recall_at,
-               search_L, search, BatchMetrics(), io_start, io_prev, io_cur,
-               current_mem_kb(), "maintenance_mode=round_complete");
+               search_L, beamwidth, search, BatchMetrics(), disk_size, aux_size_bytes, io_start, io_prev, io_cur,
+               native_start, native_prev, native_cur,
+               current_mem_kb(), "native_online", false, 0.0, 0.0, 0, store,
+               entry_init_mode, query_pool_mode, query_pool_slack,
+               "maintenance_mode=native_online;maintenance=threshold_only");
     io_prev = io_cur;
-    if (workload == "query_only") {
-      if (bg_flush_running) store.stop_bg_flush();
-      diskann::aligned_free(base_data);
-      return 0;
-    }
+    native_prev = native_cur;
   }
 
   diskann::DistanceL2 dist_cmp_l2;
@@ -663,13 +903,16 @@ static int run_fair(const std::string &workload, const std::string &base_bin,
   omp_set_schedule(static_cast<omp_sched_t>(update_schedule), 1);
 
   for (uint32_t round = 0; round < update_rounds; ++round) {
+    store.set_maintenance_epoch(round + 1);
     std::vector<uint32_t> delete_ids;
     std::vector<uint32_t> insert_ids;
     read_trace_file(trace_prefix + std::to_string(round), delete_ids, insert_ids);
+    if (!workload_has_deletes(workload)) delete_ids.clear();
+    if (!workload_has_inserts(workload)) insert_ids.clear();
 
     auto round_begin = std::chrono::high_resolution_clock::now();
     auto delete_begin = std::chrono::high_resolution_clock::now();
-#pragma omp parallel for num_threads(delete_threads) schedule(runtime)
+#pragma omp parallel for num_threads(std::max<uint32_t>(1, delete_threads)) schedule(runtime)
     for (int64_t i = 0; i < static_cast<int64_t>(delete_ids.size()); ++i) {
       store.mark_deleted(delete_ids[static_cast<size_t>(i)]);
     }
@@ -678,80 +921,103 @@ static int run_fair(const std::string &workload, const std::string &base_bin,
     std::vector<T> insert_vectors;
     size_t insert_dim = 0, insert_aligned_dim = 0;
     load_selected_vectors<T>(full_bin, insert_ids, insert_vectors, insert_dim, insert_aligned_dim);
-    std::vector<unsigned> init_ids = gather_start_ids(store, beamwidth, medoids, entry_init_mode);
-    if (init_ids.empty() && store.is_active(store.entry_point())) {
-      init_ids.push_back(static_cast<unsigned>(store.entry_point()));
-    }
-    store.protect_seed_pages(init_ids, 2);
     auto insert_begin = std::chrono::high_resolution_clock::now();
-    size_t chunk_size = insert_ids.size();
-    if (deferred_edge_high_water_mark > 0) {
-      chunk_size = std::max<size_t>(1, deferred_edge_high_water_mark / 2);
-    }
-    std::vector<std::vector<unsigned>> thread_pruned(std::max<uint32_t>(1, insert_threads));
-    std::vector<std::vector<diskann::Neighbor>> thread_candidates(std::max<uint32_t>(1, insert_threads));
-#pragma omp parallel num_threads(insert_threads)
-    {
-      InPlaceSearchScratch local_scratch;
-      local_scratch.init(aligned_dim, store.n_chunks(), sizeof(T));
-      int tid = omp_get_thread_num();
-      auto &candidates = thread_candidates[static_cast<size_t>(tid)];
-      auto &pruned = thread_pruned[static_cast<size_t>(tid)];
-      for (size_t chunk_start = 0; chunk_start < insert_ids.size(); chunk_start += chunk_size) {
-        size_t chunk_end = std::min(chunk_start + chunk_size, insert_ids.size());
+    if (!insert_ids.empty()) {
+      std::vector<unsigned> init_ids = gather_start_ids(store, beamwidth, medoids, entry_init_mode);
+      if (init_ids.empty() && store.is_active(store.entry_point())) {
+        init_ids.push_back(static_cast<unsigned>(store.entry_point()));
+      }
+      store.protect_seed_pages(init_ids, 2);
+      size_t chunk_size = insert_ids.size();
+      std::vector<std::vector<unsigned>> thread_pruned(std::max<uint32_t>(1, insert_threads));
+      std::vector<std::vector<diskann::Neighbor>> thread_candidates(std::max<uint32_t>(1, insert_threads));
+#pragma omp parallel num_threads(std::max<uint32_t>(1, insert_threads))
+      {
+        InPlaceSearchScratch local_scratch;
+        local_scratch.init(aligned_dim, store.n_chunks(), sizeof(T));
+        int tid = omp_get_thread_num();
+        auto &candidates = thread_candidates[static_cast<size_t>(tid)];
+        auto &pruned = thread_pruned[static_cast<size_t>(tid)];
+        for (size_t chunk_start = 0; chunk_start < insert_ids.size(); chunk_start += chunk_size) {
+          size_t chunk_end = std::min(chunk_start + chunk_size, insert_ids.size());
 #pragma omp for schedule(runtime)
-        for (int64_t i = static_cast<int64_t>(chunk_start); i < static_cast<int64_t>(chunk_end); ++i) {
-          uint32_t node_id = insert_ids[static_cast<size_t>(i)];
-          const T *coords = insert_vectors.data() + static_cast<size_t>(i) * insert_aligned_dim;
-          store.allocate_node(node_id);
-          local_scratch.reset();
-          candidates.clear();
-          graph_iterate_to_fixed_point<T>(coords, insert_search_L, init_ids, beamwidth,
-                                          &store, aligned_dim, dist_cmp, &local_scratch,
-                                          candidates, nullptr, DistanceScope::UPDATE,
-                                          pq_frontier_confirm_topk,
-                                          pq_confirm_mode, pq_confirm_margin, pq_confirm_delta);
-          pruned.clear();
-          graph_prune_neighbors_pq<T>(node_id, candidates, prune_R, prune_C, prune_alpha, pruned,
-                                      &store, &local_scratch, 0, nullptr, DistanceScope::UPDATE);
-          auto view = store.pin_node(node_id, WRITE);
-          std::memcpy(view.coords, coords, aligned_dim * sizeof(T));
-          view.degree = static_cast<uint16_t>(std::min<size_t>(prune_R, pruned.size()));
-          for (uint16_t j = 0; j < view.degree; ++j) view.neighbors[j] = pruned[j];
-          store.commit_node(view);
-          store.unpin_node(view);
-          maybe_encode_pq<T>(store, node_id, coords);
-          store.publish_node(node_id);
-          graph_inter_insert_deferred(node_id, pruned, &store);
-        }
-#pragma omp barrier
-#pragma omp single
-        {
-          if (deferred_edge_high_water_mark > 0 &&
-              (store.deferred_edge_bytes() / sizeof(DeferredEdge)) >= deferred_edge_high_water_mark) {
-            store.drain_deferred_edges<T>(prune_R, prune_C, prune_alpha, aligned_dim, dist_cmp);
+          for (int64_t i = static_cast<int64_t>(chunk_start); i < static_cast<int64_t>(chunk_end); ++i) {
+            uint32_t node_id = insert_ids[static_cast<size_t>(i)];
+            const T *coords = insert_vectors.data() + static_cast<size_t>(i) * insert_aligned_dim;
+            store.allocate_node(node_id);
+            local_scratch.reset();
+            candidates.clear();
+            graph_iterate_to_fixed_point<T>(coords, insert_search_L, init_ids, beamwidth,
+                                            &store, aligned_dim, dist_cmp, &local_scratch,
+                                            candidates, nullptr, DistanceScope::UPDATE,
+                                            pq_frontier_confirm_topk,
+                                            pq_confirm_mode, pq_confirm_margin, pq_confirm_delta);
+            pruned.clear();
+            graph_prune_neighbors_pq<T>(node_id, candidates, prune_R, prune_C, prune_alpha, pruned,
+                                        &store, &local_scratch, 0, nullptr, DistanceScope::UPDATE);
+            auto view = store.pin_node(node_id, WRITE);
+            std::memcpy(view.coords, coords, aligned_dim * sizeof(T));
+            view.degree = static_cast<uint16_t>(std::min<size_t>(prune_R, pruned.size()));
+            for (uint16_t j = 0; j < view.degree; ++j) view.neighbors[j] = pruned[j];
+            store.commit_node(view);
+            store.unpin_node(view);
+            maybe_encode_pq<T>(store, node_id, coords);
+            store.publish_node(node_id);
+            graph_inter_insert_deferred(node_id, pruned, prune_R, &store);
           }
         }
-#pragma omp barrier
+        local_scratch.flush_distance_stats(store.stats());
       }
-      local_scratch.flush_distance_stats(store.stats());
     }
     auto insert_end = std::chrono::high_resolution_clock::now();
-
-    if (drain_every_round) {
-      store.drain_deferred_edges<T>(prune_R, prune_C, prune_alpha, aligned_dim, dist_cmp);
+    double foreground_s = std::chrono::duration<double>(insert_end - round_begin).count();
+    pending_updates += static_cast<uint32_t>(delete_ids.size() + insert_ids.size());
+    bool maintenance_triggered = false;
+    auto maintenance_begin = std::chrono::high_resolution_clock::now();
+    (void)drain_every_round;
+    (void)sweep_every_round;
+    (void)flush_before_checkpoint;
+    uint32_t maintenance_budget = compute_sweep_budget(
+        sweep_budget_mode, sweep_budget_value,
+        std::max<uint32_t>(1, static_cast<uint32_t>(delete_ids.size() + insert_ids.size())),
+        std::max<uint32_t>(1, active_points));
+    uint32_t queued_edges = static_cast<uint32_t>(store.deferred_edge_bytes() / sizeof(DeferredEdge));
+    uint32_t queued_targets = static_cast<uint32_t>(store.deferred_edge_target_count());
+    bool overlay_pressure =
+        (reverse_edge_overlay_high_water_mark > 0 &&
+         queued_edges >= reverse_edge_overlay_high_water_mark) ||
+        (reverse_edge_overlay_target_high_water_mark > 0 &&
+         queued_targets >= reverse_edge_overlay_target_high_water_mark);
+    if (overlay_pressure) {
+      store.drain_deferred_edges<T>(prune_R, prune_C, prune_alpha, reverse_edge_pending_threshold,
+                                    aligned_dim, std::max<uint32_t>(1, maintenance_budget), dist_cmp);
+      maintenance_triggered = true;
     }
-    if (sweep_every_round) {
-      uint32_t sweep_budget = compute_sweep_budget(
-          sweep_budget_mode, sweep_budget_value,
-          static_cast<uint32_t>(delete_ids.size() + insert_ids.size()),
-          std::max<uint32_t>(1, active_points));
-      store.sweep_repair_round<T>(sweep_budget, prune_R, prune_C, prune_alpha, aligned_dim, dist_cmp);
+    if ((oversize_prune_high_water_mark > 0 &&
+         store.pending_oversized_nodes() >= oversize_prune_high_water_mark) ||
+        store.has_aged_oversized_nodes(sweep_round_period)) {
+      store.prune_oversized_nodes<T>(std::max<uint32_t>(1, maintenance_budget),
+                                     prune_R, prune_C, prune_alpha, aligned_dim,
+                                     sweep_round_period, dist_cmp);
+      maintenance_triggered = true;
     }
-    if (flush_before_checkpoint) {
+    if (tombstone_sweep_high_water_mark > 0 &&
+        store.stats().tombstone_count.load(std::memory_order_relaxed) >= tombstone_sweep_high_water_mark) {
+      store.sweep_repair_round<T>(std::max<uint32_t>(1, maintenance_budget),
+                                  prune_R, prune_C, prune_alpha, aligned_dim, dist_cmp);
+      maintenance_triggered = true;
+    }
+    if ((flush_dirty_page_high_water_mark > 0 &&
+         store.dirty_page_count() >= flush_dirty_page_high_water_mark) ||
+        (flush_dirty_ratio_threshold > 0.0 && store.dirty_ratio() >= flush_dirty_ratio_threshold)) {
       store.flush();
+      maintenance_triggered = true;
     }
-    auto round_end = std::chrono::high_resolution_clock::now();
+    auto maintenance_end = std::chrono::high_resolution_clock::now();
+    if (maintenance_triggered) {
+      pending_updates = 0;
+    }
+    auto round_end = maintenance_end;
 
     cumulative_inserts += static_cast<uint32_t>(insert_ids.size());
     cumulative_deletes += static_cast<uint32_t>(delete_ids.size());
@@ -760,13 +1026,14 @@ static int run_fair(const std::string &workload, const std::string &base_bin,
     BatchMetrics batch;
     double delete_s = std::chrono::duration<double>(delete_end - delete_begin).count();
     double insert_s = std::chrono::duration<double>(insert_end - insert_begin).count();
+    double maintenance_s = std::chrono::duration<double>(maintenance_end - maintenance_begin).count();
     double round_s = std::chrono::duration<double>(round_end - round_begin).count();
     batch.delete_throughput = delete_s > 0 ? static_cast<double>(delete_ids.size()) / delete_s : 0.0;
     batch.insert_throughput = insert_s > 0 ? static_cast<double>(insert_ids.size()) / insert_s : 0.0;
     batch.update_throughput = round_s > 0 ? static_cast<double>(delete_ids.size() + insert_ids.size()) / round_s : 0.0;
     batch.round_update_wall_time_s = round_s;
     SearchMetrics search;
-    if (workload == "query_update_round") {
+    if (workload_has_query(workload) && workload != "query_only") {
       search = run_checkpoint_search<T>(store, query_bin, gt_prefix + std::to_string(round + 1) + ".fbin",
                                         recall_at, search_L, aligned_dim,
                                         beamwidth, medoids, entry_init_mode,
@@ -774,27 +1041,41 @@ static int run_fair(const std::string &workload, const std::string &base_bin,
                                         warmup_enabled && warmup_before_each_checkpoint,
                                         warmup_query_count,
                                         pq_frontier_confirm_topk,
-                                        pq_confirm_mode, pq_confirm_margin, pq_confirm_delta);
+                                        pq_confirm_mode, pq_confirm_margin, pq_confirm_delta,
+                                        query_pool_mode, query_pool_slack);
+    } else {
+      search.candidate_pool_L_effective = insert_search_L;
+      search.pq_frontier_confirm_topk_effective = 0;
     }
     ProcIo io_cur = read_proc_io();
+    NativeIOSnapshot native_cur = read_native_io(store);
+    uint64_t disk_size = file_size_if_exists(heap_path);
     append_row(out, workload, round + 1, round + 1, base_points, active_points,
-               cumulative_inserts, cumulative_deletes, recall_at, search_L,
-               search, batch, io_start, io_prev, io_cur, current_mem_kb(),
-               workload == "update_only" ? "maintenance_mode=round_complete;recall_disabled"
-                                         : "maintenance_mode=round_complete");
+               cumulative_inserts, cumulative_deletes, recall_at, search_L, beamwidth,
+               search, batch, disk_size, aux_size_bytes, io_start, io_prev, io_cur,
+               native_start, native_prev, native_cur, current_mem_kb(),
+               "native_online", maintenance_triggered, foreground_s, maintenance_s, pending_updates, store,
+               entry_init_mode, query_pool_mode, query_pool_slack,
+               workload == "update_only"
+                   ? "maintenance_mode=native_online;recall_disabled;maintenance=overlay_truth_thresholded"
+                   : "maintenance_mode=native_online;maintenance=overlay_truth_thresholded");
     io_prev = io_cur;
+    native_prev = native_cur;
   }
 
+  store.drain_deferred_edges<T>(prune_R, prune_C, prune_alpha, 0,
+                                aligned_dim, std::numeric_limits<uint32_t>::max(), dist_cmp);
+  store.sweep_repair_round<T>(std::max<uint32_t>(1, pending_updates == 0 ? 1 : pending_updates),
+                              prune_R, prune_C, prune_alpha, aligned_dim, dist_cmp);
   store.flush();
   if (bg_flush_running) store.stop_bg_flush();
-  diskann::aligned_free(base_data);
   return 0;
 }
 
 }  // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 58) {
+  if (argc != 69) {
     std::cout << "Usage: " << argv[0]
               << " <type> <workload> <base_bin> <full_bin> <query_bin> <trace_prefix> <gt_prefix>"
               << " <pq_prefix> <pq_chunks> <pq_sample_rate> <heap_path> <result_jsonl> <base_points> <update_rounds> <recall_at>"
@@ -803,12 +1084,13 @@ int main(int argc, char **argv) {
               << " <warmup_before_each_checkpoint> <buffer_pool_frames> <page_size>"
               << " <build_R> <build_L> <build_C> <build_alpha> <build_threads> <saturate_graph>"
               << " <insert_search_L> <prune_R> <prune_C> <prune_alpha> <bp_query_frac> <bp_update_frac>"
-              << " <flush_after_build_before_measurement> <drain_every_round> <sweep_every_round>"
-              << " <sweep_budget_mode> <sweep_budget_value> <flush_before_checkpoint>"
-              << " <deferred_edge_high_water_mark> <pq_frontier_confirm_enabled> <pq_frontier_confirm_topk>"
-              << " <pq_confirm_mode> <pq_confirm_margin> <pq_confirm_delta>"
+              << " <flush_after_build_before_measurement> <drain_every_round_compat> <sweep_every_round_compat>"
+              << " <maintenance_budget_mode> <maintenance_budget_value> <flush_before_checkpoint_compat>"
+              << " <reverse_edge_overlay_high_water_mark> <reverse_edge_overlay_target_high_water_mark> <reverse_edge_pending_threshold> <oversize_prune_high_water_mark> <overlay_scan_age_compat> <tombstone_sweep_high_water_mark> <flush_dirty_page_high_water_mark> <flush_dirty_ratio_threshold>"
+              << " <pq_frontier_confirm_enabled> <pq_frontier_confirm_topk>"
+              << " <pq_confirm_mode> <pq_confirm_margin> <pq_confirm_delta> <query_pool_mode> <query_pool_slack>"
               << " <flush_budget_pages_per_cycle> <flush_wakeup_ms>"
-              << " <build_mode> <build_memory_budget_gb> <build_temp_root> <entry_init_mode>" << std::endl;
+              << " <build_mode> <build_memory_budget_gb> <build_temp_root> <entry_init_mode> <query_only_checkpoints> <reuse_existing_index>" << std::endl;
     return -1;
   }
   std::string type = argv[1];
@@ -857,17 +1139,28 @@ int main(int argc, char **argv) {
   uint32_t sweep_budget_value = static_cast<uint32_t>(std::stoul(argv[44]));
   bool flush_before_checkpoint = std::stoi(argv[45]) != 0;
   uint32_t deferred_edge_high_water_mark = static_cast<uint32_t>(std::stoul(argv[46]));
-  bool pq_frontier_confirm_enabled = std::stoi(argv[47]) != 0;
-  uint32_t pq_frontier_confirm_topk = static_cast<uint32_t>(std::stoul(argv[48]));
-  std::string pq_confirm_mode = argv[49];
-  double pq_confirm_margin = std::atof(argv[50]);
-  uint32_t pq_confirm_delta = static_cast<uint32_t>(std::stoul(argv[51]));
-  uint32_t flush_budget_pages_per_cycle = static_cast<uint32_t>(std::stoul(argv[52]));
-  uint32_t flush_wakeup_ms = static_cast<uint32_t>(std::stoul(argv[53]));
-  std::string build_mode = argv[54];
-  float build_memory_budget_gb = std::atof(argv[55]);
-  std::string build_temp_root = argv[56];
-  std::string entry_init_mode = argv[57];
+  uint32_t drain_high_water_mark = static_cast<uint32_t>(std::stoul(argv[47]));
+  uint32_t oversize_slack = static_cast<uint32_t>(std::stoul(argv[48]));
+  uint32_t oversize_prune_high_water_mark = static_cast<uint32_t>(std::stoul(argv[49]));
+  uint32_t sweep_round_period = static_cast<uint32_t>(std::stoul(argv[50]));
+  uint32_t sweep_deleted_threshold = static_cast<uint32_t>(std::stoul(argv[51]));
+  uint32_t flush_round_period = static_cast<uint32_t>(std::stoul(argv[52]));
+  double flush_dirty_ratio_threshold = std::atof(argv[53]);
+  bool pq_frontier_confirm_enabled = std::stoi(argv[54]) != 0;
+  uint32_t pq_frontier_confirm_topk = static_cast<uint32_t>(std::stoul(argv[55]));
+  std::string pq_confirm_mode = argv[56];
+  double pq_confirm_margin = std::atof(argv[57]);
+  uint32_t pq_confirm_delta = static_cast<uint32_t>(std::stoul(argv[58]));
+  std::string query_pool_mode = argv[59];
+  uint32_t query_pool_slack = static_cast<uint32_t>(std::stoul(argv[60]));
+  uint32_t flush_budget_pages_per_cycle = static_cast<uint32_t>(std::stoul(argv[61]));
+  uint32_t flush_wakeup_ms = static_cast<uint32_t>(std::stoul(argv[62]));
+  std::string build_mode = argv[63];
+  float build_memory_budget_gb = std::atof(argv[64]);
+  std::string build_temp_root = argv[65];
+  std::string entry_init_mode = argv[66];
+  uint32_t query_only_checkpoints = static_cast<uint32_t>(std::stoul(argv[67]));
+  bool reuse_existing_index = std::stoi(argv[68]) != 0;
   if (!pq_frontier_confirm_enabled) pq_frontier_confirm_topk = 0;
 
   try {
@@ -882,10 +1175,14 @@ int main(int argc, char **argv) {
                              insert_search_L, prune_R, prune_C, prune_alpha, bp_query_frac, bp_update_frac,
                              flush_after_build_before_measurement, drain_every_round, sweep_every_round,
                              sweep_budget_mode, sweep_budget_value, flush_before_checkpoint,
-                             deferred_edge_high_water_mark, pq_frontier_confirm_topk,
+                             deferred_edge_high_water_mark, drain_high_water_mark, oversize_slack, oversize_prune_high_water_mark, sweep_round_period,
+                             sweep_deleted_threshold, flush_round_period, flush_dirty_ratio_threshold,
+                             pq_frontier_confirm_topk,
                              pq_confirm_mode, pq_confirm_margin, pq_confirm_delta,
+                             query_pool_mode, query_pool_slack,
                              flush_budget_pages_per_cycle, flush_wakeup_ms,
-                             build_mode, build_memory_budget_gb, build_temp_root, entry_init_mode);
+                             build_mode, build_memory_budget_gb, build_temp_root, entry_init_mode,
+                             query_only_checkpoints, reuse_existing_index);
     }
     if (type == "uint8") {
       return run_fair<uint8_t>(workload, base_bin, full_bin, query_bin, trace_prefix, gt_prefix,
@@ -898,10 +1195,14 @@ int main(int argc, char **argv) {
                                insert_search_L, prune_R, prune_C, prune_alpha, bp_query_frac, bp_update_frac,
                                flush_after_build_before_measurement, drain_every_round, sweep_every_round,
                                sweep_budget_mode, sweep_budget_value, flush_before_checkpoint,
-                               deferred_edge_high_water_mark, pq_frontier_confirm_topk,
+                               deferred_edge_high_water_mark, drain_high_water_mark, oversize_slack, oversize_prune_high_water_mark, sweep_round_period,
+                               sweep_deleted_threshold, flush_round_period, flush_dirty_ratio_threshold,
+                               pq_frontier_confirm_topk,
                                pq_confirm_mode, pq_confirm_margin, pq_confirm_delta,
+                               query_pool_mode, query_pool_slack,
                                flush_budget_pages_per_cycle, flush_wakeup_ms,
-                               build_mode, build_memory_budget_gb, build_temp_root, entry_init_mode);
+                               build_mode, build_memory_budget_gb, build_temp_root, entry_init_mode,
+                               query_only_checkpoints, reuse_existing_index);
     }
     if (type == "int8") {
       return run_fair<int8_t>(workload, base_bin, full_bin, query_bin, trace_prefix, gt_prefix,
@@ -914,10 +1215,14 @@ int main(int argc, char **argv) {
                               insert_search_L, prune_R, prune_C, prune_alpha, bp_query_frac, bp_update_frac,
                               flush_after_build_before_measurement, drain_every_round, sweep_every_round,
                               sweep_budget_mode, sweep_budget_value, flush_before_checkpoint,
-                              deferred_edge_high_water_mark, pq_frontier_confirm_topk,
+                              deferred_edge_high_water_mark, drain_high_water_mark, oversize_slack, oversize_prune_high_water_mark, sweep_round_period,
+                              sweep_deleted_threshold, flush_round_period, flush_dirty_ratio_threshold,
+                              pq_frontier_confirm_topk,
                               pq_confirm_mode, pq_confirm_margin, pq_confirm_delta,
+                              query_pool_mode, query_pool_slack,
                               flush_budget_pages_per_cycle, flush_wakeup_ms,
-                              build_mode, build_memory_budget_gb, build_temp_root, entry_init_mode);
+                              build_mode, build_memory_budget_gb, build_temp_root, entry_init_mode,
+                              query_only_checkpoints, reuse_existing_index);
     }
     std::cerr << "Unsupported type: " << type << std::endl;
     return -1;
